@@ -36,6 +36,7 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import android.os.Build
 import android.os.Environment
@@ -43,6 +44,7 @@ import android.provider.Settings
 import androidx.core.content.ContextCompat
 import com.walkman.tv.ui.components.FolderBrowser
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
@@ -54,17 +56,23 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.ImeAction
+import androidx.compose.ui.text.input.PasswordVisualTransformation
+import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.tv.material3.Icon
 import androidx.tv.material3.Text
 import com.walkman.tv.data.model.Quality
+import com.walkman.tv.data.sync.LocalDeviceAddress
+import com.walkman.tv.data.sync.SyncState
 import com.walkman.tv.di.getLanIp
 import com.walkman.tv.ui.appContainer
 import com.walkman.tv.ui.components.QrDialog
 import com.walkman.tv.ui.components.TvFocusable
+import com.walkman.tv.ui.components.TvKeypad
 import com.walkman.tv.ui.components.TvPill
+import com.walkman.tv.ui.components.syncModeLabel
 import com.walkman.tv.ui.theme.AppColors
 import com.walkman.tv.playback.update.UpdateState
 import kotlinx.coroutines.launch
@@ -445,6 +453,8 @@ fun SettingsScreen(modifier: Modifier = Modifier) {
             }
         }
 
+        SyncSection()
+
         UpdateSection()
     }
 
@@ -707,5 +717,243 @@ private fun DeleteScriptConfirmDialog(
                 }
             }
         }
+    }
+}
+
+/** Which sync text field the on-screen remote keypad is currently typing into. */
+private enum class SyncField { Url, Code }
+
+/** How often the "当前设备地址" row re-resolves the active LAN IPv4. */
+private const val SYNC_DEVICE_ADDRESS_REFRESH_MS = 10_000L
+
+/**
+ * LX Music Sync Server configuration + status.
+ *
+ * TV-first: the remote has no usable IME for long secrets, so both fields get an optional
+ * [TvKeypad]. Nothing here touches the WebSocket / AES / RSA / library - every action goes
+ * through [com.walkman.tv.data.sync.SyncManager].
+ *
+ * There is deliberately NO user-name field: the official protocol has no such concept (users
+ * are configured on the server via `LX_USER_*`), and the connection code is the only secret.
+ */
+@Composable
+private fun SyncSection() {
+    val scope = rememberCoroutineScope()
+    val settings by appContainer.settingsStore.settings.collectAsState()
+    val state by appContainer.syncManager.state.collectAsState()
+    val message by appContainer.syncManager.message.collectAsState()
+    val serverInfo by appContainer.syncManager.serverInfo.collectAsState()
+    val context = LocalContext.current
+
+    // "当前设备地址" is re-resolved periodically: Wi-Fi/Ethernet can switch while Settings is
+    // open (and the TV may resume from standby with a different address). The interface /
+    // ConnectivityManager lookups run on IO, never on the main thread.
+    var deviceAddress by remember { mutableStateOf("未知") }
+    LaunchedEffect(Unit) {
+        while (true) {
+            val ip = withContext(Dispatchers.IO) { LocalDeviceAddress.currentLanIpv4(context) }
+            deviceAddress = ip ?: "未知"
+            delay(SYNC_DEVICE_ADDRESS_REFRESH_MS)
+        }
+    }
+
+    // Drafts are committed explicitly (保存 / any action button) so every keystroke does not
+    // rewrite settings.json.
+    var urlDraft by remember { mutableStateOf(settings.syncServerUrl) }
+    var codeDraft by remember { mutableStateOf(settings.syncConnectionCode) }
+    var showCode by remember { mutableStateOf(false) }
+    var keypad by remember { mutableStateOf<SyncField?>(null) }
+
+    LaunchedEffect(settings.syncServerUrl, settings.syncConnectionCode) {
+        urlDraft = settings.syncServerUrl
+        codeDraft = settings.syncConnectionCode
+    }
+
+    suspend fun persistDrafts() = appContainer.settingsStore.update {
+        it.copy(syncServerUrl = urlDraft.trim(), syncConnectionCode = codeDraft.trim())
+    }
+
+    // Long-running work runs on appScope so leaving Settings mid-flight neither cancels it nor
+    // loses the result. The settings write lands first, so the request uses exactly what the
+    // user sees on screen.
+    fun persistThen(action: suspend () -> Unit) {
+        appContainer.appScope.launch {
+            persistDrafts()
+            action()
+        }
+    }
+
+    Section("LX Music 数据同步") {
+        // Official-client style header: this device's LAN address + the live sync state.
+        SyncInfoRow("当前设备地址：", deviceAddress)
+        SyncInfoRow("状态：", state.displayText, syncStateColor(state))
+
+        // Remembered answer to the server's `list_sync_get_sync_mode` question. Changeable at any
+        // time; the new value applies from the next sync on and never triggers a sync by itself.
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+            SyncInfoRow("同步方式：", syncModeLabel(settings.syncMode))
+            TvPill(
+                onClick = { appContainer.syncManager.requestSyncModeChange() },
+                contentPadding = PaddingValues(horizontal = 12.dp, vertical = 6.dp),
+            ) { Text("修改同步方式", fontSize = 12.sp) }
+        }
+
+        Text(
+            "与 LX Music 手机版/桌面版共用同一个 LX Music Sync Server，用于同步「我喜欢的」和自建歌单。",
+            color = AppColors.TextMuted,
+            fontSize = 12.sp,
+        )
+
+        ToggleRow("开启同步", settings.syncEnabled) {
+            scope.launch { appContainer.settingsStore.update { it.copy(syncEnabled = !it.syncEnabled) } }
+        }
+
+        Spacer(Modifier.height(4.dp))
+        Text("服务地址", color = AppColors.TextSecondary, fontSize = 13.sp)
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            OutlinedTextField(
+                value = urlDraft,
+                onValueChange = { urlDraft = it },
+                singleLine = true,
+                modifier = Modifier.weight(1f),
+                placeholder = { Text("https://example.com/sync", color = AppColors.TextMuted) },
+                keyboardOptions = KeyboardOptions(imeAction = ImeAction.Done),
+                keyboardActions = KeyboardActions(onDone = { persistThen {} }),
+                colors = syncFieldColors(),
+            )
+            Spacer(Modifier.width(8.dp))
+            TvPill(
+                onClick = { keypad = if (keypad == SyncField.Url) null else SyncField.Url },
+                selected = keypad == SyncField.Url,
+                contentPadding = PaddingValues(horizontal = 14.dp, vertical = 10.dp),
+            ) { Text("键盘", fontSize = 13.sp) }
+        }
+
+        Spacer(Modifier.height(8.dp))
+        Text("连接码", color = AppColors.TextSecondary, fontSize = 13.sp)
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            OutlinedTextField(
+                value = codeDraft,
+                onValueChange = { codeDraft = it },
+                singleLine = true,
+                modifier = Modifier.weight(1f),
+                placeholder = { Text("LX Music Sync Server 的连接码", color = AppColors.TextMuted) },
+                visualTransformation = if (showCode) VisualTransformation.None else PasswordVisualTransformation(),
+                keyboardOptions = KeyboardOptions(imeAction = ImeAction.Done),
+                keyboardActions = KeyboardActions(onDone = { persistThen {} }),
+                colors = syncFieldColors(),
+            )
+            Spacer(Modifier.width(8.dp))
+            TvPill(
+                onClick = { showCode = !showCode },
+                selected = showCode,
+                contentPadding = PaddingValues(horizontal = 14.dp, vertical = 10.dp),
+            ) { Text(if (showCode) "隐藏" else "显示", fontSize = 13.sp) }
+            Spacer(Modifier.width(8.dp))
+            TvPill(
+                onClick = { keypad = if (keypad == SyncField.Code) null else SyncField.Code },
+                selected = keypad == SyncField.Code,
+                contentPadding = PaddingValues(horizontal = 14.dp, vertical = 10.dp),
+            ) { Text("键盘", fontSize = 13.sp) }
+        }
+
+        keypad?.let { target ->
+            Spacer(Modifier.height(8.dp))
+            TvKeypad(
+                onAppend = { c ->
+                    when (target) {
+                        SyncField.Url -> urlDraft += c
+                        SyncField.Code -> codeDraft += c
+                    }
+                },
+                onBackspace = {
+                    when (target) {
+                        SyncField.Url -> urlDraft = urlDraft.dropLast(1)
+                        SyncField.Code -> codeDraft = codeDraft.dropLast(1)
+                    }
+                },
+                onClear = {
+                    when (target) {
+                        SyncField.Url -> urlDraft = ""
+                        SyncField.Code -> codeDraft = ""
+                    }
+                },
+                onConfirm = {
+                    keypad = null
+                    persistThen {}
+                },
+            )
+        }
+
+        Spacer(Modifier.height(8.dp))
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
+            TvPill(
+                onClick = { persistThen {} },
+                contentPadding = PaddingValues(horizontal = 18.dp, vertical = 12.dp),
+            ) { Text("保存", fontSize = 13.sp) }
+            TvPill(
+                onClick = { if (!state.busy) persistThen { appContainer.syncManager.testConnection() } },
+                selected = true,
+                contentPadding = PaddingValues(horizontal = 18.dp, vertical = 12.dp),
+            ) { Text("测试连接", fontSize = 13.sp, fontWeight = FontWeight.Bold) }
+            TvPill(
+                onClick = { if (!state.busy) persistThen { appContainer.syncManager.syncNow() } },
+                contentPadding = PaddingValues(horizontal = 18.dp, vertical = 12.dp),
+            ) { Text("立即同步", fontSize = 13.sp) }
+        }
+
+        Spacer(Modifier.height(8.dp))
+        ToggleRow("自动同步", settings.syncAutoSync) {
+            scope.launch { appContainer.settingsStore.update { it.copy(syncAutoSync = !it.syncAutoSync) } }
+        }
+
+        serverInfo?.let { Text(it, color = AppColors.TextMuted, fontSize = 12.sp) }
+        Text(
+            "上次同步：${formatSyncTime(settings.syncLastSyncTime)}",
+            color = AppColors.TextMuted,
+            fontSize = 12.sp,
+        )
+        message?.let { Text(it, color = AppColors.TextSecondary, fontSize = 12.sp) }
+
+        Spacer(Modifier.height(4.dp))
+        Text(
+            "说明：收藏和自建歌单会与 LX Music 同步。播放历史仅保存在本机，不参与同步。",
+            color = AppColors.TextMuted,
+            fontSize = 11.sp,
+        )
+    }
+}
+
+@Composable
+private fun syncFieldColors() = OutlinedTextFieldDefaults.colors(
+    focusedTextColor = AppColors.TextPrimary,
+    unfocusedTextColor = AppColors.TextPrimary,
+    focusedBorderColor = AppColors.AccentGreen,
+    unfocusedBorderColor = AppColors.Card,
+    cursorColor = AppColors.AccentGreen,
+)
+
+private fun syncStateColor(state: SyncState): Color = when (state) {
+    SyncState.Connected, SyncState.Success -> AppColors.AccentGreen
+    SyncState.AuthFailed, SyncState.BlockedIp, is SyncState.Error -> AppColors.Danger
+    SyncState.VersionIncompatible, SyncState.ServiceUnavailable, SyncState.NeedSyncMode -> AppColors.Warning
+    else -> AppColors.TextSecondary
+}
+
+private fun formatSyncTime(millis: Long?): String {
+    if (millis == null || millis <= 0L) return "尚未同步"
+    val fmt = java.text.SimpleDateFormat("yyyy-MM-dd HH:mm", java.util.Locale.getDefault())
+    return fmt.format(java.util.Date(millis))
+}
+
+/** Read-only `label value` row (official-client style) used by the sync header. */
+@Composable
+private fun SyncInfoRow(label: String, value: String, valueColor: Color = AppColors.TextPrimary) {
+    Row(verticalAlignment = Alignment.CenterVertically) {
+        Text(label, color = AppColors.TextSecondary, fontSize = 13.sp)
+        Text(value, color = valueColor, fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
     }
 }

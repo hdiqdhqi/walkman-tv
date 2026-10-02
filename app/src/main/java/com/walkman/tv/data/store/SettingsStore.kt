@@ -51,12 +51,37 @@ data class Settings(
         com.walkman.tv.data.model.SourceID.KG,
         com.walkman.tv.data.model.SourceID.TX,
     ),
+    // --- LX Music Sync Server (see data/sync/). Credentials issued by the server
+    // (clientId/key) live in SyncAuthStore, NOT here; there is deliberately no user name,
+    // because the official protocol has no such field - users are configured server-side.
+
+    /** Master switch. Also drives the auto-connect on app start, like the official client. */
+    val syncEnabled: Boolean = false,
+    /** Base address of the sync server, e.g. `https://c.wwwweb.top/sync`. Normalized on use. */
+    val syncServerUrl: String = "",
+    /** The server's connection code (password). Only sent for the first-time authentication. */
+    val syncConnectionCode: String = "",
+    /** Auto-sync on data change - consumed from stage B onward; persisted now. */
+    val syncAutoSync: Boolean = false,
+    /** Wall-clock time of the last *completed* list sync (null until stage B implements it). */
+    val syncLastSyncTime: Long? = null,
+    /**
+     * Remembered answer to the server's `list_sync_get_sync_mode` question: one of the official
+     * `LX.Sync.List.SyncMode` values, or null when the user has never chosen.
+     *
+     * The official client asks the user every single time; persisting the answer is a UI-level
+     * convenience so a TV remote never has to re-pick mid-sync. The wire protocol is unchanged -
+     * this value is still sent as the official mode string. `cancel` is never stored.
+     */
+    val syncMode: String? = null,
 )
 
 /** App preferences persisted as JSON. */
-class SettingsStore(context: Context) {
+class SettingsStore internal constructor(filesDir: File) {
+    constructor(context: Context) : this(context.filesDir)
+
     private val store = JsonStore(
-        File(context.filesDir, "settings.json"),
+        File(filesDir, "settings.json"),
         Settings.serializer(),
         Settings(),
     )

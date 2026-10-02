@@ -34,6 +34,7 @@ import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
 import androidx.tv.material3.Text
+import com.walkman.tv.ui.components.SyncModeDialog
 import com.walkman.tv.ui.components.TopNav
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.map
@@ -52,6 +53,11 @@ fun RootScreen(modifier: Modifier = Modifier) {
     var section by remember { mutableStateOf(NavSection.Recommend) }
     var showPlayer by remember { mutableStateOf(false) }
     var showExitDialog by remember { mutableStateOf(false) }
+
+    // LX Music sync: the server asks this device to pick a merge/overwrite mode in the middle of
+    // a sync. Handled at the root so the dialog shows on any screen - auto-sync runs right after
+    // bootstrap, when the user is usually still on the home screen.
+    val syncModeRequest by appContainer.syncManager.syncModeRequest.collectAsState()
     val recommendFocus = remember { FocusRequester() }
     val context = LocalContext.current
 
@@ -148,6 +154,13 @@ fun RootScreen(modifier: Modifier = Modifier) {
                     (context as? Activity)?.finishAndRemoveTask()
                     android.os.Process.killProcess(android.os.Process.myPid())
                 },
+            )
+        }
+
+        if (syncModeRequest != null) {
+            SyncModeDialog(
+                onChoose = { appContainer.syncManager.chooseSyncMode(it) },
+                onCancel = { appContainer.syncManager.cancelSyncMode() },
             )
         }
     }

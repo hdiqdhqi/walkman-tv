@@ -92,10 +92,21 @@ class AppContainer(val appContext: Context) {
     }
 
     val scriptStore: ScriptStore by lazy { ScriptStore(appContext, sourceManager) }
-    val libraryStore: LibraryStore by lazy { LibraryStore(appContext) }
+    val libraryStore: LibraryStore by lazy { LibraryStore(appContext.filesDir) }
     val settingsStore: SettingsStore by lazy { SettingsStore(appContext) }
     val playbackSnapshotStore: PlaybackSnapshotStore by lazy { PlaybackSnapshotStore(appContext) }
     val searchHistoryStore: SearchHistoryStore by lazy { SearchHistoryStore(appContext) }
+
+    /** LX Music Sync Server: credentials, transport and the UI-facing state machine. */
+    val syncAuthStore: com.walkman.tv.data.sync.SyncAuthStore by lazy {
+        com.walkman.tv.data.sync.SyncAuthStore(appContext)
+    }
+    val syncClient: com.walkman.tv.data.sync.SyncClient by lazy {
+        com.walkman.tv.data.sync.SyncClient(httpClient, syncAuthStore, appScope)
+    }
+    val syncManager: com.walkman.tv.data.sync.SyncManager by lazy {
+        com.walkman.tv.data.sync.SyncManager(settingsStore, syncClient, libraryStore, appScope)
+    }
     val coverCache: com.walkman.tv.data.store.CoverCache by lazy {
         com.walkman.tv.data.store.CoverCache(appContext)
     }
@@ -222,6 +233,10 @@ class AppContainer(val appContext: Context) {
         appScope.launch {
             settingsStore.loadAll()
             libraryStore.loadAll()
+            // Restore server credentials before any auto-connect so a returning user never has
+            // to re-type the connection code (the stored clientId/key re-authenticate silently).
+            syncAuthStore.loadAll()
+            syncManager.start()
             settingsStore.settings.onEach { s ->
                 playbackController.preferredQuality = s.preferredQuality
                 playbackController.setAudioOffloadEnabled(s.audioOffloadEnabled)

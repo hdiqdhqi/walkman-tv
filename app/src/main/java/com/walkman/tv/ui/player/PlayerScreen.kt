@@ -275,6 +275,16 @@ fun PlayerScreen(onClose: () -> Unit, modifier: Modifier = Modifier) {
 
 // ============== Vinyl disc (去除了中心小黑洞，封面直达圆心) =====================================================================
 
+/**
+ * Fixed black-vinyl palette. The disc never follows the album cover or the theme accent, so it
+ * stays a classic black record instead of being tinted green/blue/red per song.
+ */
+private val VinylBase = Color(0xFF0E0E0E)
+private val VinylMid = Color(0xFF161616)
+private val VinylRim = Color(0xFF1F1F1F)
+private val VinylGroove = Color(0xFF9E9E9E)
+private val VinylHighlight = Color(0xFF3C3C3C)
+
 @Composable
 private fun VinylDisc(picURL: String?, isPlaying: Boolean, modifier: Modifier = Modifier) {
   val rotation = remember { Animatable(0f) }
@@ -291,7 +301,7 @@ private fun VinylDisc(picURL: String?, isPlaying: Boolean, modifier: Modifier = 
   val circle = androidx.compose.foundation.shape.CircleShape
 
   Box(modifier = modifier.aspectRatio(1f), contentAlignment = Alignment.Center) {
-    // 1) 外圈绿光晕 (填满全尺寸)
+    // 1) 外圈暗色光晕 (填满全尺寸) - 固定黑色系，不跟随专辑封面或主题强调色
     Box(
       modifier = Modifier
         .fillMaxSize()
@@ -299,9 +309,9 @@ private fun VinylDisc(picURL: String?, isPlaying: Boolean, modifier: Modifier = 
         .background(
           Brush.radialGradient(
             colors = listOf(
-              AppColors.AccentGreen.copy(alpha = 0.55f),
-              AppColors.AccentGreen.copy(alpha = 0.20f),
-              AppColors.AccentGreen.copy(alpha = 0.00f),
+              VinylMid.copy(alpha = 0.55f),
+              VinylBase.copy(alpha = 0.20f),
+              Color.Transparent,
             ),
           ),
         ),
@@ -341,14 +351,14 @@ private fun VinylGrooves(modifier: Modifier) {
 
     val baseScale = outerRadius / 150.dp.toPx()
 
-    drawCircle(color = Color(0xFF0E2818), radius = outerRadius, center = center)
+    drawCircle(color = VinylBase, radius = outerRadius, center = center)
 
     drawCircle(
       brush = Brush.radialGradient(
         colors = listOf(
-          Color(0xFF0A1F12),
-          Color(0xFF112F1C),
-          Color(0xFF1B4528),
+          VinylBase,
+          VinylMid,
+          VinylRim,
         ),
         center = center,
         radius = outerRadius,
@@ -364,22 +374,23 @@ private fun VinylGrooves(modifier: Modifier) {
       val alpha = 0.20f + 0.10f * ((i % 5) / 5f)
       val w = (if (i % 7 == 0) 1.2.dp.toPx() else 0.6.dp.toPx()) * baseScale
       drawCircle(
-        color = Color.Black.copy(alpha = alpha),
+        color = VinylGroove.copy(alpha = alpha * 0.30f),
         radius = r,
         center = center,
         style = androidx.compose.ui.graphics.drawscope.Stroke(width = w),
       )
     }
 
+    // Low-brightness grey highlights: keeps the record's edge readable on a black disc.
     drawCircle(
-      color = AppColors.AccentGreen.copy(alpha = 0.45f),
+      color = VinylHighlight.copy(alpha = 0.45f),
       radius = innerRadius + 2.dp.toPx() * baseScale,
       center = center,
       style = androidx.compose.ui.graphics.drawscope.Stroke(width = 1.5.dp.toPx() * baseScale),
     )
 
     drawCircle(
-      color = AppColors.AccentGreen.copy(alpha = 0.55f),
+      color = VinylHighlight.copy(alpha = 0.55f),
       radius = outerRadius - 1.dp.toPx() * baseScale,
       center = center,
       style = androidx.compose.ui.graphics.drawscope.Stroke(width = 2.dp.toPx() * baseScale),

@@ -80,6 +80,13 @@ android {
     buildFeatures {
         compose true
     }
+
+    // Unit tests are plain JVM tests (no Robolectric). The sync layer avoids Android APIs,
+    // but a couple of files still call android.util.Log, so give those calls their default
+    // (no-op) values instead of the "not mocked" exception.
+    testOptions {
+        unitTests.returnDefaultValues = true
+    }
     composeOptions {
         kotlinCompilerExtensionVersion rootProject.ext.composeCompilerVersion
     }
@@ -156,6 +163,9 @@ dependencies {
 
     // Custom-source JS engine (kept from the RN app)
     implementation "wang.harlon.quickjs:wrapper-android:3.2.3"
+
+    // Unit tests (JVM). The LX sync protocol/data layer is covered offline by a fake server.
+    testImplementation "junit:junit:4.13.2"
 
     // Phone-to-TV QR flow: tiny in-app HTTP server + QR encoder
     implementation "org.nanohttpd:nanohttpd:2.3.1"

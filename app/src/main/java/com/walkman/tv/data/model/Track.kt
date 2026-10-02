@@ -1,6 +1,7 @@
 package com.walkman.tv.data.model
 
 import kotlinx.serialization.Serializable
+import kotlinx.serialization.json.JsonElement
 
 /**
  * A playable song, mirroring iOS `Track`. [extras] carries source-specific fields the v4 JS
@@ -19,6 +20,14 @@ data class Track(
     val picURL: String? = null,
     val qualities: List<Quality> = emptyList(),
     val extras: Map<String, String> = emptyMap(),
+    /**
+     * LX-sync passthrough for `MusicInfo.meta` values that are not plain strings and have no
+     * typed counterpart on [Track] (e.g. `qualitys` / `_qualitys`). Kept out of [extras] on
+     * purpose: extras is forwarded verbatim as JS `musicInfo` fields (see SourceManager) and a
+     * nested value there would change the wire shape the source scripts expect. Only
+     * `data/sync/LxMusicMapper` reads or writes this.
+     */
+    val syncMeta: Map<String, JsonElement> = emptyMap(),
 ) {
     val subtitle: String
         get() = if (!albumName.isNullOrEmpty()) "$singer · $albumName" else singer

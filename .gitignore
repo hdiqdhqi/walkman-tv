@@ -20,3 +20,6 @@ claude.info
 .claude/
 .vscode/
 .dbg/
+
+# LX Music sync protocol research snapshot — reference only, never commit
+.lxsync-research/
