@@ -8,6 +8,9 @@ import com.walkman.tv.data.model.DownloadRecord
 import com.walkman.tv.data.model.DownloadStatus
 import com.walkman.tv.data.model.Quality
 import com.walkman.tv.data.model.Track
+import com.walkman.tv.playback.download.DownloadFileDeleteResult
+import com.walkman.tv.playback.download.DownloadFileLocator
+import com.walkman.tv.playback.download.DownloadFileTarget
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -185,28 +188,65 @@ class DownloadStore(private val context: Context) {
         }
     }
 
-    /** Best-effort delete of the file backing [record] (File or SAF). */
-    fun deleteBackingFile(record: DownloadRecord) {
-        val saf = record.safUri
-        if (saf != null) {
-            runCatching { DocumentFile.fromSingleUri(context, Uri.parse(saf))?.delete() }
-            return
+    /**
+     * Delete the file backing [record] — a plain [File] or a SAF document. Reports the outcome
+     * instead of swallowing it, so the UI can surface a real error (spec: no silent failures).
+     *
+     * For a SAF record the delete must go through the ContentResolver ([DocumentFile.delete]);
+     * `File.delete()` would be wrong even though the record also carries a `fileName`.
+     */
+    fun deleteFileFor(record: DownloadRecord): DownloadFileDeleteResult {
+        return when (val target = DownloadFileLocator.locate(record) { rootFor(it) }) {
+            is DownloadFileTarget.SafDocument -> deleteSafDocument(target.uri)
+            is DownloadFileTarget.PlainFile -> deletePlainFile(record, target)
+            DownloadFileTarget.None -> DownloadFileDeleteResult.NothingToDelete
         }
-        if (record.fileName.isEmpty()) return
+    }
+
+    private fun deleteSafDocument(uri: String): DownloadFileDeleteResult = try {
+        val doc = DocumentFile.fromSingleUri(context, Uri.parse(uri))
+        when {
+            doc == null -> DownloadFileDeleteResult.Failed("无法访问该文件")
+            !doc.exists() -> DownloadFileDeleteResult.Deleted
+            doc.delete() -> DownloadFileDeleteResult.Deleted
+            else -> DownloadFileDeleteResult.Failed("系统拒绝删除该文件")
+        }
+    } catch (t: Throwable) {
+        DownloadFileDeleteResult.Failed(
+            t.message?.takeIf { it.isNotBlank() } ?: (t.javaClass.simpleName ?: "删除失败"),
+        )
+    }
+
+    private fun deletePlainFile(
+        record: DownloadRecord,
+        target: DownloadFileTarget.PlainFile,
+    ): DownloadFileDeleteResult {
+        val file = target.file
+        var ok = true
+        if (file.exists() && !file.delete()) ok = false
+        if (target.partFile.exists() && !target.partFile.delete()) ok = false
+        if (!ok) return DownloadFileDeleteResult.Failed("无法删除本地文件")
+        // Prune the now-empty album / artist dirs the downloader created, so a deleted song
+        // doesn't leave empty folders behind. Best-effort: failure here is never an error.
         val root = rootFor(record)
-        val file = File(root, record.fileName)
-        file.delete()
-        File(file.parentFile, file.name + ".part").delete()
         file.parentFile?.let { albumDir ->
             if (albumDir.isDirectory && albumDir.list().isNullOrEmpty()) {
                 albumDir.delete()
                 albumDir.parentFile?.let { artistDir ->
-                    if (artistDir.isDirectory && artistDir.list().isNullOrEmpty() && artistDir != root) {
+                    if (artistDir.isDirectory && artistDir.list().isNullOrEmpty() &&
+                        artistDir.path != root.path
+                    ) {
                         artistDir.delete()
                     }
                 }
             }
         }
+        return DownloadFileDeleteResult.Deleted
+    }
+
+    /** Best-effort legacy wrapper: delete the file backing [record], ignoring the outcome. */
+    fun deleteBackingFile(record: DownloadRecord) {
+        deleteFileFor(record)
     }
 
     /** Playable Uri string for a completed download (File `file://` or SAF `content://`), or null

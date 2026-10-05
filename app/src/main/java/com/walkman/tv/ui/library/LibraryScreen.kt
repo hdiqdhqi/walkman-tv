@@ -490,6 +490,30 @@ private fun DownloadedTab(
     val nowId = appContainer.playbackController.state.collectAsState().value.currentTrack?.id
     // COMPLETED downloads whose file is gone — stay listed here but flagged 文件缺失 + retry.
     val missing by appContainer.downloadStore.missingDownloads.collectAsState()
+    val scope = rememberCoroutineScope()
+    val context = androidx.compose.ui.platform.LocalContext.current
+    // Long-press flow: action menu → second confirmation → real delete (File or SAF).
+    var actionTrack by remember { mutableStateOf<com.walkman.tv.data.model.Track?>(null) }
+    var confirmTrack by remember { mutableStateOf<com.walkman.tv.data.model.Track?>(null) }
+
+    fun deleteDownload(track: com.walkman.tv.data.model.Track) {
+        scope.launch {
+            when (val result = appContainer.downloadCoordinator.deleteDownload(track.id)) {
+                com.walkman.tv.playback.download.DeleteDownloadResult.Deleted ->
+                    android.widget.Toast.makeText(
+                        context,
+                        "已删除下载：" + track.name,
+                        android.widget.Toast.LENGTH_SHORT,
+                    ).show()
+                is com.walkman.tv.playback.download.DeleteDownloadResult.Failed ->
+                    android.widget.Toast.makeText(
+                        context,
+                        "删除失败：" + result.message,
+                        android.widget.Toast.LENGTH_LONG,
+                    ).show()
+            }
+        }
+    }
 
     androidx.compose.foundation.lazy.LazyColumn(
         modifier = Modifier
@@ -541,6 +565,7 @@ private fun DownloadedTab(
                             nowPlaying = track.id == nowId,
                             onPlay = { onPlay(tracks, idx) },
                             onRetry = { appContainer.downloadCoordinator.redownload(track.id) },
+                            onLongClick = { actionTrack = track },
                         )
                     } else {
                         com.walkman.tv.ui.components.TrackRow(
@@ -548,6 +573,7 @@ private fun DownloadedTab(
                             index = idx,
                             nowPlaying = track.id == nowId,
                             onClick = { onPlay(tracks, idx) },
+                            onLongClick = { actionTrack = track },
                         )
                     }
                 }
@@ -562,6 +588,27 @@ private fun DownloadedTab(
                 EmptyHint("还没有下载，去搜索 / 歌单里长按歌曲下载", Modifier.fillMaxSize())
             }
         }
+    }
+
+    actionTrack?.let { track ->
+        com.walkman.tv.ui.components.DownloadTrackActionDialog(
+            track = track,
+            onDeleteDownload = {
+                actionTrack = null
+                confirmTrack = track
+            },
+            onDismiss = { actionTrack = null },
+        )
+    }
+    confirmTrack?.let { track ->
+        com.walkman.tv.ui.components.DeleteDownloadConfirmDialog(
+            track = track,
+            onConfirm = {
+                confirmTrack = null
+                deleteDownload(track)
+            },
+            onDismiss = { confirmTrack = null },
+        )
     }
 }
 
@@ -654,13 +701,14 @@ private fun MissingDownloadRow(
     nowPlaying: Boolean,
     onPlay: () -> Unit,
     onRetry: () -> Unit,
+    onLongClick: () -> Unit = {},
 ) {
     Row(
         modifier = Modifier.fillMaxWidth().padding(horizontal = 2.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
         // Left block: focusable → plays (network fallback). Mirrors a normal row's layout.
-        TvFocusable(onClick = onPlay, modifier = Modifier.weight(1f)) {
+        TvFocusable(onClick = onPlay, onLongClick = onLongClick, modifier = Modifier.weight(1f)) {
             Row(
                 modifier = Modifier.fillMaxWidth().padding(horizontal = 10.dp, vertical = 8.dp),
                 verticalAlignment = Alignment.CenterVertically,

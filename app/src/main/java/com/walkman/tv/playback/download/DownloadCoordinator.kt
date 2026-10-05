@@ -18,9 +18,20 @@ import kotlinx.coroutines.async
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.withPermit
+import kotlinx.coroutines.withContext
 import okhttp3.OkHttpClient
 import java.io.File
 import java.util.concurrent.ConcurrentHashMap
+
+/** Result of a user-initiated 「删除下载」, reported back to the UI. */
+sealed interface DeleteDownloadResult {
+
+    /** File + cover + record are gone. */
+    data object Deleted : DeleteDownloadResult
+
+    /** A real failure. [message] is safe to show the user; the record is left in place. */
+    data class Failed(val message: String) : DeleteDownloadResult
+}
 
 /**
  * Orchestrates the download lifecycle. Spec §3.2 + §3.3.
@@ -163,12 +174,26 @@ class DownloadCoordinator(
 
     /** Remove a finished (or failed) record — deletes the file + its cached cover. */
     fun removeDownload(trackID: String) {
-        scope.launch {
-            val rec = store.recordFor(trackID) ?: return@launch
-            jobs.remove(trackID)?.cancel()
-            deleteFile(rec)
-            coverCache.remove(trackID)
-            store.removeRecord(trackID)
+        scope.launch { deleteDownload(trackID) }
+    }
+
+    /**
+     * Delete one downloaded song at the user's request: the backing file (plain File or SAF
+     * document), its cached cover, and the download record.
+     *
+     * Runs on IO and reports the real outcome. On failure the record is intentionally **kept** so
+     * the file is never orphaned from the bookkeeping and the user can see the error + retry.
+     */
+    suspend fun deleteDownload(trackID: String): DeleteDownloadResult = withContext(Dispatchers.IO) {
+        val rec = store.recordFor(trackID) ?: return@withContext DeleteDownloadResult.Deleted
+        jobs.remove(trackID)?.cancel()
+        when (val fileResult = store.deleteFileFor(rec)) {
+            is DownloadFileDeleteResult.Failed -> DeleteDownloadResult.Failed(fileResult.message)
+            DownloadFileDeleteResult.Deleted, DownloadFileDeleteResult.NothingToDelete -> {
+                coverCache.remove(trackID)
+                store.removeRecord(trackID)
+                DeleteDownloadResult.Deleted
+            }
         }
     }
 
