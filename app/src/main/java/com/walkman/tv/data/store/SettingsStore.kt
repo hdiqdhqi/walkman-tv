@@ -20,6 +20,16 @@ enum class LyricSize(val label: String, val activeSp: Int, val inactiveSp: Int, 
     MAX("最大", 40, 24, 18),
 }
 
+/** Color theme for the player's spinning vinyl disc. Palettes live in PlayerScreen. */
+@Serializable
+enum class VinylColor(val label: String) {
+    GREEN("翠绿"),
+    BLACK("经典黑"),
+    RED("酒红"),
+    BLUE("深蓝"),
+    GOLD("琥珀金"),
+}
+
 @Serializable
 data class Settings(
     val preferredQuality: Quality = Quality.FLAC24,
@@ -31,6 +41,23 @@ data class Settings(
     val audioOffloadEnabled: Boolean = true,
     val showLyricTranslation: Boolean = true,
     val lyricSize: LyricSize = LyricSize.STANDARD,
+    /** Color theme for the player's spinning vinyl disc. The palettes live in PlayerScreen; they
+     *  were merged from the upstream `feat/vinyl-refresh-autohide` branch. The default is the
+     *  upstream default ([VinylColor.GREEN]); [VinylColor.BLACK] 经典黑 reproduces the fixed black
+     *  record this build used to render. */
+    val vinylColor: VinylColor = VinylColor.GREEN,
+    /** Player screen: hide progress bar + transport after a few idle seconds; any D-pad / OK key
+     *  brings them back. Off by default. */
+    val autoHidePlayerControls: Boolean = false,
+    /**
+     * Default "跳转播放" (hand-off) player, stored as a flattened component name
+     * (`packageName/activityName`). Null (the default) means the next tap shows Android's own
+     * chooser and remembers whatever the user picks there. This is deliberately NOT a global "use
+     * an external player" mode — the hand-off only ever starts from an explicit tap.
+     */
+    val defaultHandoffPlayer: String? = null,
+    /** Best-effort human-readable label of [defaultHandoffPlayer], shown in settings. */
+    val defaultHandoffPlayerLabel: String? = null,
     /** Absolute path of the chosen download root (a writable storage volume). null ⇒ default
      *  app-scoped Music dir on primary storage. See DownloadStore.availableRoots(). */
     val customDownloadDir: String? = null,
@@ -43,6 +70,17 @@ data class Settings(
     /** Batch "下载全部": when a track is already downloaded but at a different quality than the
      *  chosen target, re-download it to match (true) vs. always skip already-downloaded (false). */
     val redownloadOnQualityChange: Boolean = true,
+    // --- Imported songlists (网易云 / QQ音乐 / 酷狗 / 酷我 share-link import). See data/songlist/.
+
+    /** Global switch for the background refresh of imported playlists. Per-list opt-outs live in
+     *  `ImportedSonglist.autoUpdate`, so this only has to gate the whole feature off. */
+    val songlistAutoUpdateEnabled: Boolean = true,
+    /** Minimum hours between two automatic refreshes of the same playlist (clamped to >= 1 on use). */
+    val songlistAutoUpdateIntervalHours: Int = 6,
+    /** Mirror update of an imported playlist: keep songs that were added by hand (true) instead of
+     *  overwriting the list with exactly what the platform returned (false, LX's plain
+     *  `overwriteListMusics` behaviour). Hand-added songs are never dropped silently. */
+    val songlistKeepManualOnUpdate: Boolean = true,
     /** Sources that feed the discover (home) page. Spec docs/discover-page-spec-android-tv.md §2:
      *  fixed 4 in order kw → wy → kg → tx, default all enabled. */
     val homeSources: Set<com.walkman.tv.data.model.SourceID> = setOf(

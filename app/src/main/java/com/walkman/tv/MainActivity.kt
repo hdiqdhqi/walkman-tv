@@ -30,6 +30,28 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    override fun onResume() {
+        super.onResume()
+        // Lifecycle breadcrumbs for the running log (spec §21); purely observational.
+        runCatching { App.container.runLog.event(com.walkman.tv.data.logging.LogLevel.INFO, "App", "APP_RESUME") }
+    }
+
+    override fun onPause() {
+        runCatching { App.container.runLog.event(com.walkman.tv.data.logging.LogLevel.INFO, "App", "APP_PAUSE") }
+        super.onPause()
+    }
+
+    /**
+     * Screen-level key hook. The full-screen player registers [AppEvents.keyInterceptor] while
+     * "播放控件自动隐藏" is active: once the controls hide, nothing inside Compose is focusable, so
+     * the D-pad events would never reach the Compose tree — they are caught here instead.
+     * See PlayerScreen's auto-hide block (upstream `feat/vinyl-refresh-autohide`).
+     */
+    override fun dispatchKeyEvent(event: KeyEvent): Boolean {
+        if (App.container.events.keyInterceptor?.invoke(event) == true) return true
+        return super.dispatchKeyEvent(event)
+    }
+
     /**
      * Forward the remote's "Menu / Options / 三条横线" button into the Compose tree via
      * [App.container.events]. Needed because the AndroidView-hosted [androidx.media3.ui.PlayerView]

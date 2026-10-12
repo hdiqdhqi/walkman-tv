@@ -32,7 +32,7 @@ class LxListSyncServiceTest {
     private fun setup(initial: LibraryStore.SyncLists = LibraryStore.SyncLists(emptyList(), emptyList(), emptyList())) {
         store = LibraryStore(tempDir())
         repository = SyncRepository(store)
-        service = LxListSyncService(repository, SyncApplier(store, repository)) { requestedMode }
+        service = LxListSyncService(repository, SyncApplier(store, repository)) { SyncModeAnswer(requestedMode) }
         runBlocking { store.overwriteSyncLists(initial) }
     }
 

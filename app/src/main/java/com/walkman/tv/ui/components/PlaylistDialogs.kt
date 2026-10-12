@@ -224,14 +224,6 @@ fun PlaylistNameDialog(
 ) {
     var name by remember { mutableStateOf(initial) }
     var showQr by remember { mutableStateOf(false) }
-    val fieldFocus = remember { FocusRequester() }
-    val keyboard = androidx.compose.ui.platform.LocalSoftwareKeyboardController.current
-
-    // Auto-focus the text field on open so the system IME can be invoked immediately.
-    LaunchedEffect(Unit) {
-        runCatching { fieldFocus.requestFocus() }
-        runCatching { keyboard?.show() }
-    }
     // QR-submitted names get pushed straight into the field.
     LaunchedEffect(Unit) {
         appContainer.events.qrPlaylistName.collect { received ->
@@ -254,49 +246,55 @@ fun PlaylistNameDialog(
             Text(title, color = AppColors.TextPrimary, fontSize = 18.sp, fontWeight = FontWeight.Bold)
             Spacer(Modifier.size(10.dp))
 
-            // Real editable text field — Compose brings up the system IME on focus, supporting
-            // whichever Chinese / pinyin keyboard the user has installed.
-            androidx.compose.foundation.text.BasicTextField(
-                value = name,
-                onValueChange = { v -> if (v.length <= 24) name = v },
-                singleLine = true,
-                textStyle = androidx.compose.ui.text.TextStyle(
-                    color = AppColors.TextPrimary,
-                    fontSize = 18.sp,
-                    fontWeight = FontWeight.SemiBold,
-                ),
-                cursorBrush = androidx.compose.ui.graphics.SolidColor(AppColors.AccentGreen),
-                keyboardOptions = androidx.compose.foundation.text.KeyboardOptions(
-                    imeAction = androidx.compose.ui.text.input.ImeAction.Done,
-                ),
-                keyboardActions = androidx.compose.foundation.text.KeyboardActions(
-                    onDone = {
-                        val trimmed = name.trim()
-                        if (trimmed.isNotEmpty()) onConfirm(trimmed)
-                    },
-                ),
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .clip(RoundedCornerShape(10.dp))
-                    .background(AppColors.BgDeep)
-                    .padding(horizontal = 14.dp, vertical = 14.dp)
-                    .focusRequester(fieldFocus),
-                decorationBox = { inner ->
-                    Box {
-                        if (name.isEmpty()) {
-                            Text(
-                                "请输入歌单名（按确认键调出系统输入法）",
-                                color = AppColors.TextMuted,
-                                fontSize = 14.sp,
-                                fontWeight = FontWeight.Medium,
-                                maxLines = 1,
-                                overflow = TextOverflow.Ellipsis,
-                            )
-                        }
-                        inner()
-                    }
+            // Real editable text field — Compose brings up the system IME once the user presses OK
+            // on it (D-pad focus alone only draws the ring), supporting whichever Chinese / pinyin
+            // keyboard the user has installed.
+            TvFocusGatedField(
+                modifier = Modifier.fillMaxWidth(),
+                imeAction = androidx.compose.ui.text.input.ImeAction.Done,
+                keepFocusOnExit = false,
+                // Done: submitting the name closes the dialog, so no focus hand-off is needed.
+                onImeDone = {
+                    val trimmed = name.trim()
+                    if (trimmed.isNotEmpty()) onConfirm(trimmed)
                 },
-            )
+            ) { slot ->
+                androidx.compose.foundation.text.BasicTextField(
+                    value = name,
+                    onValueChange = { v -> if (v.length <= 24) name = v },
+                    singleLine = true,
+                    textStyle = androidx.compose.ui.text.TextStyle(
+                        color = AppColors.TextPrimary,
+                        fontSize = 18.sp,
+                        fontWeight = FontWeight.SemiBold,
+                    ),
+                    cursorBrush = androidx.compose.ui.graphics.SolidColor(AppColors.AccentGreen),
+                    keyboardOptions = slot.keyboardOptions,
+                    keyboardActions = slot.keyboardActions,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clip(RoundedCornerShape(10.dp))
+                        .background(AppColors.BgDeep)
+                        .padding(horizontal = 14.dp, vertical = 14.dp)
+                        .leaveFieldOnBack()
+                        .then(slot.modifier),
+                    decorationBox = { inner ->
+                        Box {
+                            if (name.isEmpty()) {
+                                Text(
+                                    "请输入歌单名（按确认键调出系统输入法）",
+                                    color = AppColors.TextMuted,
+                                    fontSize = 14.sp,
+                                    fontWeight = FontWeight.Medium,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis,
+                                )
+                            }
+                            inner()
+                        }
+                    },
+                )
+            }
             Spacer(Modifier.size(6.dp))
             Text(
                 "中文输入不便？点击「手机扫码输入」用手机键盘",

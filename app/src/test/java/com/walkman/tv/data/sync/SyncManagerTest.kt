@@ -13,6 +13,7 @@ import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.serialization.json.JsonArray
+import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.encodeToJsonElement
 import okhttp3.OkHttpClient
@@ -38,6 +39,7 @@ class SyncManagerTest {
     private lateinit var libraryStore: LibraryStore
     private lateinit var scope: CoroutineScope
     private lateinit var client: FakeSyncClient
+    private lateinit var baselineStore: SyncBaselineStore
     private lateinit var manager: SyncManager
 
     @Before
@@ -47,7 +49,8 @@ class SyncManagerTest {
         libraryStore = LibraryStore(dir)
         scope = CoroutineScope(Dispatchers.Default + SupervisorJob())
         client = FakeSyncClient(scope)
-        manager = SyncManager(settingsStore, client, libraryStore, scope)
+        baselineStore = SyncBaselineStore(dir)
+        manager = SyncManager(settingsStore, client, libraryStore, scope, baselineStore)
     }
 
     @After
@@ -372,6 +375,162 @@ class SyncManagerTest {
         }
         assertEquals(SyncState.Disabled, manager.state.value)
     }
+
+    // --------------------------------------------------------------- the push direction
+
+    /** Waits until the fake server received an official action matching [predicate]. */
+    private fun awaitAction(predicate: (LxListAction) -> Boolean) = runBlocking {
+        val deadline = System.currentTimeMillis() + 20_000
+        var found = false
+        while (!found && System.currentTimeMillis() < deadline) {
+            found = client.pushedActions.any { runCatching { predicate(LxListAction.parse(it)) }.getOrDefault(false) }
+            if (!found) delay(50)
+        }
+        assertTrue("no matching push within 20s: ${client.pushedActions}", found)
+    }
+
+    /** Every action the fake server received, parsed. */
+    private fun pushedActions(): List<LxListAction> = client.pushedActions.map { LxListAction.parse(it) }
+
+    private fun addedIds(action: LxListAction) = when (action) {
+        is LxListAction.AddMusic -> action.musicInfos.map { it.id }
+        else -> emptyList()
+    }
+
+    @Test(timeout = 40_000)
+    fun `a user edit is pushed as an official action without a full re-sync`() {
+        enableSync(autoSync = true)
+        rememberMode(LxSyncProtocol.SYNC_MODE_MERGE_LOCAL_REMOTE)
+        manager.start()
+        runBlocking { manager.state.first { it == SyncState.Success } }
+        assertEquals(1, client.sessions.get())
+
+        runBlocking { libraryStore.toggleFavorite(track(songmid = "new")) }
+        awaitAction { it is LxListAction.AddMusic }
+
+        assertEquals("the edit must not need a second session", 1, client.sessions.get())
+        val adds = pushedActions().filterIsInstance<LxListAction.AddMusic>()
+        assertEquals(listOf(listOf("kw_new")), adds.map { addedIds(it) })
+    }
+
+    @Test(timeout = 40_000)
+    fun `deleting a song is pushed as a removal`() {
+        enableSync(autoSync = true)
+        rememberMode(LxSyncProtocol.SYNC_MODE_MERGE_LOCAL_REMOTE)
+        manager.start()
+        runBlocking { manager.state.first { it == SyncState.Success } }
+        runBlocking { libraryStore.toggleFavorite(track(songmid = "a")) }
+        awaitAction { it is LxListAction.AddMusic }
+
+        runBlocking { libraryStore.toggleFavorite(track(songmid = "a")) }
+        awaitAction { it is LxListAction.RemoveMusic }
+
+        val removals = pushedActions().filterIsInstance<LxListAction.RemoveMusic>()
+        assertEquals(listOf("kw_a"), removals.last().ids)
+        assertEquals(1, client.sessions.get())
+    }
+
+    @Test(timeout = 40_000)
+    fun `an online-songlist refresh never pushes the platform order`() {
+        enableSync(autoSync = true)
+        rememberMode(LxSyncProtocol.SYNC_MODE_MERGE_LOCAL_REMOTE)
+        manager.start()
+        runBlocking { manager.state.first { it == SyncState.Success } }
+
+        // The importer wrote the list and the last agreement already holds exactly these songs.
+        runBlocking {
+            libraryStore.overwriteSyncLists(
+                LibraryStore.SyncLists(
+                    defaultList = emptyList(),
+                    love = emptyList(),
+                    userLists = listOf(
+                        com.walkman.tv.data.model.Playlist(
+                            "p",
+                            "导入歌单",
+                            listOf(track(songmid = "a"), track(songmid = "b")),
+                            source = "tx",
+                            sourceListId = "1",
+                        ),
+                    ),
+                ),
+            )
+            baselineStore.save(SyncBaselines.of(libraryStore.syncLists(), "server-1"))
+            // The platform handed the same songs back in a different running order.
+            libraryStore.replaceListTracks(
+                "p",
+                listOf(track(songmid = "b"), track(songmid = "a")),
+                LibraryStore.ListChangeSource.ONLINE_REFRESH,
+            )
+        }
+
+        runBlocking { delay(3_000) }
+
+        assertTrue(
+            "a platform reorder must never be pushed: ${client.pushedActions}",
+            client.pushedActions.isEmpty(),
+        )
+        assertEquals(1, client.sessions.get())
+    }
+
+    @Test(timeout = 40_000)
+    fun `a refresh that really changes the songs still reaches the server`() {
+        enableSync(autoSync = true)
+        rememberMode(LxSyncProtocol.SYNC_MODE_MERGE_LOCAL_REMOTE)
+        manager.start()
+        runBlocking { manager.state.first { it == SyncState.Success } }
+
+        runBlocking {
+            libraryStore.overwriteSyncLists(
+                LibraryStore.SyncLists(
+                    defaultList = emptyList(),
+                    love = emptyList(),
+                    userLists = listOf(
+                        com.walkman.tv.data.model.Playlist(
+                            "p",
+                            "导入歌单",
+                            listOf(track(songmid = "a")),
+                            source = "tx",
+                            sourceListId = "1",
+                        ),
+                    ),
+                ),
+            )
+            baselineStore.save(SyncBaselines.of(libraryStore.syncLists(), "server-1"))
+            libraryStore.replaceListTracks(
+                "p",
+                listOf(track(songmid = "a"), track(songmid = "b")),
+                LibraryStore.ListChangeSource.ONLINE_REFRESH,
+            )
+        }
+
+        awaitAction { it is LxListAction.AddMusic && it.listId == "p" }
+
+        assertEquals(1, client.sessions.get())
+    }
+
+    @Test(timeout = 60_000)
+    fun `an edit with no live session falls back to a full sync`() {
+        enableSync(autoSync = true)
+        rememberMode(LxSyncProtocol.SYNC_MODE_MERGE_LOCAL_REMOTE)
+        manager.start()
+        runBlocking { manager.state.first { it == SyncState.Success } }
+        assertEquals(1, client.sessions.get())
+
+        manager.disconnect()
+        runBlocking { libraryStore.toggleFavorite(track(songmid = "new")) }
+        runBlocking {
+            val deadline = System.currentTimeMillis() + 40_000
+            while (client.sessions.get() < 2 && System.currentTimeMillis() < deadline) delay(50)
+        }
+
+        assertEquals(
+            "no live session, so the change travels via a session (state=${manager.state.value}, msg=${manager.message.value})",
+            2,
+            client.sessions.get(),
+        )
+        assertTrue(client.pushedActions.isEmpty())
+        assertEquals(listOf("kw_new"), libraryStore.syncLists().love.map { it.id })
+    }
 }
 
 /**
@@ -408,6 +567,17 @@ private class FakeSyncClient(
     private var readyGate = CompletableDeferred<Boolean>()
 
     override val isReady: Boolean get() = readyGate.isCompleted
+
+    /** Every official `onListSyncAction` payload this fake server received, in order. */
+    val pushedActions = java.util.concurrent.CopyOnWriteArrayList<JsonElement>()
+
+    override suspend fun call(path: String, args: List<JsonElement>): JsonElement? {
+        if (path == LxListAction.PUSH_METHOD) {
+            args.firstOrNull()?.let { pushedActions += it }
+            return JsonPrimitive(true)
+        }
+        return super.call(path, args)
+    }
 
     override suspend fun authenticate(config: SyncConfig, onPhase: (SyncState) -> Unit): AuthOutcome =
         authFailure

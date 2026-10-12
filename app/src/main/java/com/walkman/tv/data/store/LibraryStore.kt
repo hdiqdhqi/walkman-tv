@@ -64,12 +64,28 @@ class LibraryStore(filesDir: File) {
     val defaultList: StateFlow<Playlist> = _defaultList.asStateFlow()
 
     /**
-     * Emits once after every *user* change to a synced list (收藏 / 自建歌单 / defaultList).
+     * Where a change to a synced list came from. LX Sync pushes *user* edits to the server as
+     * soon as they happen (the official clients do this too), but a refresh of an imported online
+     * songlist must not drag the platform's running order onto the other devices - it only has to
+     * propagate the songs that were actually added or removed. The two paths therefore announce
+     * themselves separately.
+     */
+    enum class ListChangeSource {
+        /** The TV's user edited a list: 收藏 / 加歌 / 删歌 / 新建 / 删除 / 改名 / 导入. */
+        USER,
+
+        /** An imported online songlist was re-read from its platform (see `data/songlist/`). */
+        ONLINE_REFRESH,
+    }
+
+    /**
+     * Emits once after every change to a synced list (收藏 / 自建歌单 / defaultList), carrying
+     * [ListChangeSource] so the sync layer can tell a user edit from an online refresh.
      * Sync-applied writes deliberately do NOT emit, so auto-sync cannot re-trigger itself.
      * History and downloads never emit - neither is part of LX sync.
      */
-    private val _changes = MutableSharedFlow<Unit>(extraBufferCapacity = 4)
-    val changes: SharedFlow<Unit> = _changes.asSharedFlow()
+    private val _changes = MutableSharedFlow<ListChangeSource>(extraBufferCapacity = 4)
+    val changes: SharedFlow<ListChangeSource> = _changes.asSharedFlow()
 
     suspend fun loadAll() {
         val data = withContext(Dispatchers.IO) { store.load() }
@@ -105,8 +121,17 @@ class LibraryStore(filesDir: File) {
         persist()
     }
 
-    suspend fun createList(name: String): Playlist {
-        val list = Playlist(name = name)
+    /**
+     * [source] / [sourceListId] are set only by the online-songlist importer, so a list created
+     * from a platform share link keeps its origin and can be refreshed later (see
+     * `data/songlist/SonglistAutoUpdater`). Hand-built lists leave both null.
+     */
+    suspend fun createList(
+        name: String,
+        source: String? = null,
+        sourceListId: String? = null,
+    ): Playlist {
+        val list = Playlist(name = name, source = source, sourceListId = sourceListId)
         writeLock.withLock {
             _userLists.value = _userLists.value + list
             persist()
@@ -160,6 +185,37 @@ class LibraryStore(filesDir: File) {
         notifyChanged()
     }
 
+    /**
+     * Full replacement of a user list's tracks — LX Music's `overwriteListMusics`, used by the
+     * imported-songlist refresh (`data/songlist/`). One StateFlow update + one disk write, and it
+     * emits [changes] so the refresh also rolls into LX sync. [source] defaults to a user edit; the
+     * online refresher passes [ListChangeSource.ONLINE_REFRESH] so the platform's playing order is
+     * not pushed to the other devices. Returns false when the list no longer exists (deleted
+     * locally or by a remote sync action).
+     */
+    suspend fun replaceListTracks(
+        listId: String,
+        tracks: List<Track>,
+        source: ListChangeSource = ListChangeSource.USER,
+    ): Boolean = writeLock.withLock {
+        val seen = HashSet<String>()
+        val deduped = tracks.filter { seen.add(it.id) }
+        var found = false
+        _userLists.value = _userLists.value.map { pl ->
+            if (pl.id == listId) {
+                found = true
+                pl.copy(tracks = deduped, updatedAt = System.currentTimeMillis())
+            } else {
+                pl
+            }
+        }
+        if (found) {
+            persist()
+            notifyChanged(source)
+        }
+        found
+    }
+
     // ---------------------------------------------------------------- LX Music sync surface
 
     /** The three lists the LX protocol syncs, in official order. History is never part of this. */
@@ -197,8 +253,8 @@ class LibraryStore(filesDir: File) {
         persist()
     }
 
-    private fun notifyChanged() {
-        _changes.tryEmit(Unit)
+    private fun notifyChanged(source: ListChangeSource = ListChangeSource.USER) {
+        _changes.tryEmit(source)
     }
 
     private suspend fun persist() = withContext(Dispatchers.IO) {

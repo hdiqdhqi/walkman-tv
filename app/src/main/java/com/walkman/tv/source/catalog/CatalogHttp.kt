@@ -12,25 +12,37 @@ const val MOBILE_UA =
 
 class CatalogException(message: String) : Exception(message)
 
-/** Thin HTTP helper for the direct platform catalog/search/leaderboard/songlist APIs. */
-class CatalogHttp(private val client: OkHttpClient) {
+/**
+ * The verbs the catalog layer needs. Extracted so a platform fetcher (playlist paging in
+ * particular) can be driven by canned, desensitised responses in a JVM test - no network, no
+ * MockWebServer, no live platform.
+ */
+interface CatalogHttpLike {
+    suspend fun getText(url: String, headers: Map<String, String> = emptyMap()): String
+    suspend fun postForm(url: String, form: String, headers: Map<String, String> = emptyMap()): String
+    suspend fun postJson(url: String, json: String, headers: Map<String, String> = emptyMap()): String
+    suspend fun resolveFinalUrl(url: String, headers: Map<String, String> = emptyMap()): String?
+}
 
-    suspend fun getText(url: String, headers: Map<String, String> = emptyMap()): String =
+/** Thin HTTP helper for the direct platform catalog/search/leaderboard/songlist APIs. */
+class CatalogHttp(private val client: OkHttpClient) : CatalogHttpLike {
+
+    override suspend fun getText(url: String, headers: Map<String, String>): String =
         exec(Request.Builder().url(url).applyHeaders(headers).get().build())
 
-    suspend fun postForm(url: String, form: String, headers: Map<String, String> = emptyMap()): String {
+    override suspend fun postForm(url: String, form: String, headers: Map<String, String>): String {
         val body = form.toRequestBody("application/x-www-form-urlencoded".toMediaTypeOrNull())
         return exec(Request.Builder().url(url).applyHeaders(headers).post(body).build())
     }
 
-    suspend fun postJson(url: String, json: String, headers: Map<String, String> = emptyMap()): String {
+    override suspend fun postJson(url: String, json: String, headers: Map<String, String>): String {
         val body = json.toRequestBody("application/json".toMediaTypeOrNull())
         return exec(Request.Builder().url(url).applyHeaders(headers).post(body).build())
     }
 
     /** Follow redirects for [url] and return the final effective URL (for short-link expansion).
      *  Returns null on failure. */
-    suspend fun resolveFinalUrl(url: String, headers: Map<String, String> = emptyMap()): String? =
+    override suspend fun resolveFinalUrl(url: String, headers: Map<String, String>): String? =
         withContext(Dispatchers.IO) {
             runCatching {
                 client.newCall(Request.Builder().url(url).applyHeaders(headers).get().build())

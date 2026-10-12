@@ -1,17 +1,22 @@
 package com.walkman.tv.data.sync
 
+import kotlinx.serialization.KSerializer
 import kotlinx.serialization.SerializationException
 import kotlinx.serialization.Serializable
+import kotlinx.serialization.builtins.ListSerializer
+import kotlinx.serialization.builtins.serializer
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.decodeFromJsonElement
+import kotlinx.serialization.json.encodeToJsonElement
 
 /** Official `LX.AddMusicLocationType`: where `list_music_add` / `list_music_move` insert. */
-enum class AddMusicLocation {
-    TOP,
-    BOTTOM;
+enum class AddMusicLocation(val wireKey: String) {
+    TOP("top"),
+    BOTTOM("bottom");
 
     companion object {
         fun fromKey(key: String?): AddMusicLocation = if (key == "top") TOP else BOTTOM
@@ -65,6 +70,13 @@ sealed interface LxListAction {
     data class ClearMusic(val listIds: List<String>) : LxListAction
 
     companion object {
+        /**
+         * RPC name of the official `remoteQueueList` method a client calls to push one action to the
+         * server (`socket.remoteQueueList.onListSyncAction(action)`); the server applies it to its
+         * own lists and broadcasts it to the other devices.
+         */
+        const val PUSH_METHOD = "onListSyncAction"
+
         /**
          * Parses a server action object `{action, data}`. Throws [LxSyncRpcException] for an
          * unknown action or a malformed payload - exactly like the official handlers, which let
@@ -130,6 +142,58 @@ sealed interface LxListAction {
                 "list_music_clear" -> ClearMusic(decodeStringList(data, name))
                 else -> throw LxSyncRpcException("unknown list sync action: $name")
             }
+
+        /**
+         * Encodes one action into the official `{action, data}` object that is sent back to the
+         * server as `onListSyncAction(data)` - the push direction.
+         *
+         * It reuses the very same private DTOs [parse] reads, so this client can only ever emit a
+         * payload it would also understand, and the wire shape stays in one place.
+         */
+        fun encode(action: LxListAction): JsonElement = when (action) {
+            is DataOverwrite -> actionOf("list_data_overwrite", LxListData.serializer(), action.data)
+            is CreateLists -> actionOf("list_create", ActionCreateDto.serializer(), ActionCreateDto(action.position, action.listInfos))
+            is RemoveLists -> actionOf("list_remove", LIST_OF_STRING, action.ids)
+            is UpdateLists -> actionOf("list_update", LIST_OF_USER_LIST_INFO, action.lists)
+            is UpdateListPosition -> actionOf("list_update_position", ActionPositionDto.serializer(), ActionPositionDto(action.position, action.ids))
+            is AddMusic -> actionOf(
+                "list_music_add",
+                ActionMusicAddDto.serializer(),
+                ActionMusicAddDto(action.listId, action.musicInfos, action.location.wireKey),
+            )
+            is MoveMusic -> actionOf(
+                "list_music_move",
+                ActionMusicMoveDto.serializer(),
+                ActionMusicMoveDto(action.fromId, action.toId, action.musicInfos, action.location.wireKey),
+            )
+            is RemoveMusic -> actionOf("list_music_remove", ActionMusicRemoveDto.serializer(), ActionMusicRemoveDto(action.listId, action.ids))
+            is UpdateMusic -> actionOf(
+                "list_music_update",
+                LIST_OF_MUSIC_UPDATE,
+                action.entries.map { MusicUpdateDto(it.listId, it.musicInfo) },
+            )
+            is UpdateMusicPosition -> actionOf(
+                "list_music_update_position",
+                ActionMusicPositionDto.serializer(),
+                ActionMusicPositionDto(action.listId, action.position, action.ids),
+            )
+            is OverwriteMusic -> actionOf(
+                "list_music_overwrite",
+                ActionMusicOverwriteDto.serializer(),
+                ActionMusicOverwriteDto(action.listId, action.musicInfos),
+            )
+            is ClearMusic -> actionOf("list_music_clear", LIST_OF_STRING, action.listIds)
+        }
+
+        private fun <T> actionOf(name: String, serializer: KSerializer<T>, data: T): JsonElement =
+            buildJsonObject {
+                put("action", JsonPrimitive(name))
+                put("data", LxListJson.json.encodeToJsonElement(serializer, data))
+            }
+
+        private val LIST_OF_STRING = ListSerializer(String.serializer())
+        private val LIST_OF_USER_LIST_INFO = ListSerializer(LxUserListInfo.serializer())
+        private val LIST_OF_MUSIC_UPDATE = ListSerializer(MusicUpdateDto.serializer())
 
         private fun <T> decode(
             element: JsonElement?,

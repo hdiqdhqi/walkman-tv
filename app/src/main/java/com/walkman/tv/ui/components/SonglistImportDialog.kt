@@ -13,8 +13,6 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.BasicTextField
-import androidx.compose.foundation.text.KeyboardActions
-import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
@@ -25,8 +23,6 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
-import androidx.compose.ui.focus.FocusRequester
-import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
@@ -38,6 +34,7 @@ import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
 import androidx.tv.material3.Text
 import com.walkman.tv.data.model.SourceID
+import com.walkman.tv.data.model.OnlinePlaylist
 import com.walkman.tv.playback.imports.SonglistImporter
 import com.walkman.tv.playback.imports.SonglistRef
 import com.walkman.tv.ui.appContainer
@@ -53,11 +50,14 @@ import kotlinx.coroutines.launch
  *      [SonglistImporter.parse] / [SonglistImporter.pureIdOrNull] so the recognition status
  *      flips between "✓ 已识别" / source picker / nothing in real time.
  *   2. Optional 歌单名 override — same control as PlaylistNameDialog (with QR fallback).
- *   3. 确定导入 → [SonglistImporter.importPlaylist] off the UI thread. 900ms confirmation, then
- *      dismiss. Errors render inline as red text so the user can correct and retry.
+ *   3. 预览 reads the complete playlist and shows 歌单名 / 平台 / 歌曲数 *before* anything is
+ *      created; 确定导入 reuses that same fetch ([SonglistImporter.createFromFetched]) so
+ *      previewing never costs a second request. 900ms confirmation, then dismiss. Errors render
+ *      inline as red text so the user can correct and retry.
  *
  * BACK closes the dialog *except* while importing — partial state would orphan a half-filled
- * playlist.
+ * playlist. Instead, 取消 / 取消导入 aborts the *fetch* while the playlist is being read (nothing
+ * has been created yet); the two writes of the creation step itself are not interruptible.
  */
 @Composable
 fun SonglistImportDialog(onDismiss: () -> Unit) {
@@ -66,6 +66,12 @@ fun SonglistImportDialog(onDismiss: () -> Unit) {
     var customName by remember { mutableStateOf("") }
     var manualSource by remember { mutableStateOf<SourceID?>(null) }
     var importing by remember { mutableStateOf(false) }
+    var previewing by remember { mutableStateOf(false) }
+    var preview by remember { mutableStateOf<OnlinePlaylist?>(null) }
+    var importJob by remember { mutableStateOf<kotlinx.coroutines.Job?>(null) }
+    // True only while the playlist is being *read*. Creating the list is two writes that must not
+    // be split, so the cancel affordance is offered just for the (long) fetch phase.
+    var canCancelImport by remember { mutableStateOf(false) }
     var doneCount by remember { mutableStateOf<Int?>(null) }
     var errorText by remember { mutableStateOf<String?>(null) }
     var showQr by remember { mutableStateOf(false) }
@@ -77,15 +83,11 @@ fun SonglistImportDialog(onDismiss: () -> Unit) {
     }
     // Direct expression — recomputed on every recomposition; cheap and avoids snapshot tracking
     // pitfalls (the inputs are plain values, not State, so derivedStateOf wouldn't help).
-    val canImport = !importing && doneCount == null && (
-        parsedRef != null || (pureId != null && manualSource != null)
-        )
-    val urlFocus = remember { FocusRequester() }
-    val keyboard = androidx.compose.ui.platform.LocalSoftwareKeyboardController.current
-    LaunchedEffect(Unit) {
-        runCatching { urlFocus.requestFocus() }
-        runCatching { keyboard?.show() }
-    }
+    val resolvedRef = parsedRef ?: pureId?.let { id -> manualSource?.let { s -> SonglistRef(s, id) } }
+    val canImport = !importing && !previewing && doneCount == null && resolvedRef != null
+    // A preview is dropped as soon as the input changes, so 确定导入 can never create a playlist
+    // from a link other than the one currently in the box.
+    LaunchedEffect(raw, manualSource) { preview = null }
     // QR-pushed URL replaces whatever's in the field.
     LaunchedEffect(Unit) {
         appContainer.events.qrSonglistUrl.collect { received ->
@@ -98,6 +100,9 @@ fun SonglistImportDialog(onDismiss: () -> Unit) {
         onDismissRequest = { if (!importing) onDismiss() },
         properties = DialogProperties(usePlatformDefaultWidth = false),
     ) {
+        // Read inside Dialog: it's a separate window with its own focus owner.
+        val focusManager = androidx.compose.ui.platform.LocalFocusManager.current
+        val keyboard = androidx.compose.ui.platform.LocalSoftwareKeyboardController.current
         Column(
             modifier = Modifier
                 .width(540.dp)
@@ -116,42 +121,52 @@ fun SonglistImportDialog(onDismiss: () -> Unit) {
 
             Text("歌单链接", color = AppColors.TextPrimary, fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
             Spacer(Modifier.size(6.dp))
-            BasicTextField(
-                value = raw,
-                onValueChange = {
-                    raw = it
-                    errorText = null
-                },
-                singleLine = true,
-                textStyle = TextStyle(
-                    color = AppColors.TextPrimary,
-                    fontSize = 14.sp,
-                    fontWeight = FontWeight.Medium,
-                ),
-                cursorBrush = SolidColor(AppColors.AccentGreen),
-                keyboardOptions = KeyboardOptions(imeAction = ImeAction.Done),
-                keyboardActions = KeyboardActions(onDone = { /* keep open, no submit */ }),
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .clip(RoundedCornerShape(10.dp))
-                    .background(AppColors.BgDeep)
-                    .padding(horizontal = 14.dp, vertical = 12.dp)
-                    .focusRequester(urlFocus),
-                decorationBox = { inner ->
-                    Box {
-                        if (raw.isEmpty()) {
-                            Text(
-                                "粘贴链接或纯数字 ID（手机扫码更省事）",
-                                color = AppColors.TextMuted,
-                                fontSize = 14.sp,
-                                maxLines = 1,
-                                overflow = TextOverflow.Ellipsis,
-                            )
+            // D-pad focus only draws the ring; the IME opens on an explicit OK press.
+            TvFocusGatedField(
+                modifier = Modifier.fillMaxWidth(),
+                imeAction = ImeAction.Done,
+                keepFocusOnExit = false,
+                // Done: keep the dialog open (no submit) but step off the field so the remote can reach 导入.
+                onImeDone = { leaveField(focusManager, keyboard) },
+            ) { slot ->
+                BasicTextField(
+                    value = raw,
+                    onValueChange = {
+                        raw = it
+                        errorText = null
+                    },
+                    singleLine = true,
+                    textStyle = TextStyle(
+                        color = AppColors.TextPrimary,
+                        fontSize = 14.sp,
+                        fontWeight = FontWeight.Medium,
+                    ),
+                    cursorBrush = SolidColor(AppColors.AccentGreen),
+                    keyboardOptions = slot.keyboardOptions,
+                    keyboardActions = slot.keyboardActions,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clip(RoundedCornerShape(10.dp))
+                        .background(AppColors.BgDeep)
+                        .padding(horizontal = 14.dp, vertical = 12.dp)
+                        .leaveFieldOnBack()
+                        .then(slot.modifier),
+                    decorationBox = { inner ->
+                        Box {
+                            if (raw.isEmpty()) {
+                                Text(
+                                    "粘贴链接或纯数字 ID（手机扫码更省事）",
+                                    color = AppColors.TextMuted,
+                                    fontSize = 14.sp,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis,
+                                )
+                            }
+                            inner()
                         }
-                        inner()
-                    }
-                },
-            )
+                    },
+                )
+            }
             Spacer(Modifier.size(6.dp))
             when {
                 parsedRef != null -> Text(
@@ -208,6 +223,41 @@ fun SonglistImportDialog(onDismiss: () -> Unit) {
                     fontWeight = FontWeight.SemiBold,
                 )
             }
+            if (previewing) {
+                Spacer(Modifier.size(12.dp))
+                Text(
+                    "正在读取歌单…",
+                    color = AppColors.AccentGreen,
+                    fontSize = 13.sp,
+                    fontWeight = FontWeight.SemiBold,
+                )
+            }
+            preview?.let { p ->
+                Spacer(Modifier.size(12.dp))
+                Text(
+                    "预览：${p.info.name}",
+                    color = AppColors.TextPrimary,
+                    fontSize = 13.sp,
+                    fontWeight = FontWeight.SemiBold,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+                Text(
+                    buildString {
+                        append(p.ref.source.displayName)
+                        append(" · ").append(p.tracks.size).append(" 首")
+                        val declared = p.declaredTotal
+                        if (declared != null && declared != p.tracks.size) {
+                            append("（平台标注 ").append(declared).append(" 首）")
+                        }
+                        if (!p.complete) append(" · 只取到部分歌曲")
+                    },
+                    color = if (p.complete) AppColors.TextMuted else AppColors.Warning,
+                    fontSize = 12.sp,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+            }
             doneCount?.let {
                 Spacer(Modifier.size(12.dp))
                 Text(
@@ -236,36 +286,90 @@ fun SonglistImportDialog(onDismiss: () -> Unit) {
                 }
                 Spacer(Modifier.weight(1f))
                 TvPill(
-                    onClick = { if (!importing) onDismiss() },
-                    contentPadding = PaddingValues(horizontal = 18.dp, vertical = 8.dp),
-                ) {
-                    Text(if (doneCount != null) "完成" else "取消", fontSize = 13.sp)
-                }
-                if (doneCount == null) {
-                    val startImport: () -> Unit = startImport@{
-                        if (!canImport) return@startImport
-                        val ref = parsedRef ?: pureId?.let { id ->
-                            manualSource?.let { s -> SonglistRef(s, id) }
-                        } ?: return@startImport
-                        importing = true
+                    onClick = {
+                        val ref = resolvedRef ?: return@TvPill
+                        if (importing || previewing || doneCount != null) return@TvPill
+                        previewing = true
                         errorText = null
                         scope.launch {
                             runCatching {
-                                SonglistImporter.importPlaylist(
-                                    ref = ref,
+                                SonglistImporter.fetchPlaylist(ref, appContainer.onlinePlaylistRepository)
+                            }.onSuccess {
+                                preview = it
+                                previewing = false
+                            }.onFailure {
+                                errorText = it.localizedMessage ?: it.toString()
+                                previewing = false
+                            }
+                        }
+                    },
+                    selected = canImport,
+                    contentPadding = PaddingValues(horizontal = 18.dp, vertical = 8.dp),
+                ) {
+                    Text(if (previewing) "读取中…" else "预览", fontSize = 13.sp)
+                }
+                TvPill(
+                    onClick = {
+                        when {
+                            !importing -> onDismiss()
+                            // Long playlists can take a while: let the user abort the fetch. Nothing
+                            // has been created yet at this point, so aborting is always safe.
+                            canCancelImport -> {
+                                importJob?.cancel()
+                                importing = false
+                                canCancelImport = false
+                                errorText = "已取消导入"
+                            }
+                            else -> Unit
+                        }
+                    },
+                    contentPadding = PaddingValues(horizontal = 18.dp, vertical = 8.dp),
+                ) {
+                    Text(
+                        when {
+                            doneCount != null -> "完成"
+                            importing && canCancelImport -> "取消导入"
+                            else -> "取消"
+                        },
+                        fontSize = 13.sp,
+                    )
+                }
+                if (doneCount == null) {
+                    val startImport: () -> Unit = startImport@{
+                        val ref = resolvedRef ?: return@startImport
+                        if (!canImport) return@startImport
+                        importing = true
+                        errorText = null
+                        importJob = scope.launch {
+                            runCatching {
+                                // Reuse a preview when one exists: it is the same fetch the import
+                                // would have done, so previewing does not cost a second download.
+                                val fetched = preview ?: run {
+                                    canCancelImport = true
+                                    SonglistImporter.fetchPlaylist(ref, appContainer.onlinePlaylistRepository)
+                                }
+                                canCancelImport = false
+                                SonglistImporter.createFromFetched(
+                                    online = fetched,
                                     customName = customName.takeIf { it.isNotBlank() },
-                                    songlists = appContainer.songlists,
                                     library = appContainer.libraryStore,
+                                    origins = appContainer.importedSonglistStore,
                                 )
                             }.onSuccess { result ->
                                 doneCount = result.count
                                 importing = false
+                                canCancelImport = false
                                 // 900ms grace so user sees the confirmation before dismiss.
                                 delay(900)
                                 onDismiss()
                             }.onFailure { e ->
-                                errorText = e.localizedMessage ?: e.toString()
+                                errorText = if (e is kotlinx.coroutines.CancellationException) {
+                                    "已取消导入"
+                                } else {
+                                    e.localizedMessage ?: e.toString()
+                                }
                                 importing = false
+                                canCancelImport = false
                             }
                         }
                     }

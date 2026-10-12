@@ -17,8 +17,6 @@ import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.foundation.text.KeyboardActions
-import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.AutoAwesome
@@ -33,6 +31,7 @@ import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.OutlinedTextFieldDefaults
 import androidx.compose.runtime.Composable
 import androidx.compose.foundation.layout.height
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.focus.FocusRequester
@@ -41,6 +40,7 @@ import androidx.compose.ui.platform.LocalContext
 import android.os.Build
 import android.os.Environment
 import android.provider.Settings
+import android.widget.Toast
 import androidx.core.content.ContextCompat
 import com.walkman.tv.ui.components.FolderBrowser
 import kotlinx.coroutines.Dispatchers
@@ -65,10 +65,12 @@ import androidx.tv.material3.Icon
 import androidx.tv.material3.Text
 import com.walkman.tv.data.model.Quality
 import com.walkman.tv.data.sync.LocalDeviceAddress
+import com.walkman.tv.data.logging.RunLog
 import com.walkman.tv.data.sync.SyncState
 import com.walkman.tv.di.getLanIp
 import com.walkman.tv.ui.appContainer
 import com.walkman.tv.ui.components.QrDialog
+import com.walkman.tv.ui.components.TvFocusGatedField
 import com.walkman.tv.ui.components.TvFocusable
 import com.walkman.tv.ui.components.TvKeypad
 import com.walkman.tv.ui.components.TvPill
@@ -224,9 +226,211 @@ fun SettingsScreen(modifier: Modifier = Modifier) {
             }
         }
 
+        Section("歌单自动更新") {
+            // Playlists imported from a platform share link (网易云 / QQ音乐 / 酷狗 / 酷我) remember
+            // their origin and can be re-fetched: on demand from the playlist page, and on this
+            // schedule in the background — LX Music's per-list isAutoUpdate. 咪咕 has no songlist
+            // API, so its lists are never queued.
+            ToggleRow("自动更新导入的歌单", settings.songlistAutoUpdateEnabled) {
+                scope.launch {
+                    appContainer.settingsStore.update { it.copy(songlistAutoUpdateEnabled = !it.songlistAutoUpdateEnabled) }
+                }
+            }
+            if (settings.songlistAutoUpdateEnabled) {
+                Spacer(Modifier.height(6.dp))
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
+                    // The pills configure the *background* cadence; while the app is on screen the
+                    // foreground poller re-checks every SonglistAutoUpdateConfig.FOREGROUND_CHECK_INTERVAL_MS.
+                    Text("后台更新间隔", color = AppColors.TextMuted, fontSize = 12.sp)
+                    listOf(3, 6, 12, 24).forEach { hours ->
+                        TvPill(
+                            onClick = {
+                                scope.launch { appContainer.settingsStore.update { it.copy(songlistAutoUpdateIntervalHours = hours) } }
+                            },
+                            selected = settings.songlistAutoUpdateIntervalHours == hours,
+                        ) {
+                            Text("$hours 小时", fontSize = 13.sp)
+                        }
+                    }
+                }
+                Spacer(Modifier.height(4.dp))
+                Text(
+                    "应用在前台时每 " +
+                        "${com.walkman.tv.data.songlist.SonglistAutoUpdateConfig.FOREGROUND_CHECK_INTERVAL_MS / 60_000} " +
+                        "分钟检查一次在线歌单，只有检测到变化才会更新（不会重复写入，也不会因此触发同步推送）。",
+                    color = AppColors.TextMuted,
+                    fontSize = 11.sp,
+                    maxLines = 2,
+                    overflow = TextOverflow.Ellipsis,
+                )
+            }
+            var bulkStatus by remember { mutableStateOf<String?>(null) }
+            Spacer(Modifier.height(6.dp))
+            Row(horizontalArrangement = Arrangement.spacedBy(10.dp), verticalAlignment = Alignment.CenterVertically) {
+                TvPill(
+                    onClick = {
+                        bulkStatus = "正在更新…"
+                        scope.launch {
+                            val r = appContainer.songlistAutoUpdater.updateAllNow()
+                            bulkStatus = when {
+                                r.attempted == 0 -> "没有可更新的歌单"
+                                r.applied == 0 && r.failed > 0 -> "更新失败（${r.failed} 个）"
+                                r.failed == 0 && r.skipped == 0 -> "已更新 ${r.applied} 个歌单"
+                                else -> "已更新 ${r.applied} 个，跳过 ${r.skipped} 个，失败 ${r.failed} 个"
+                            }
+                        }
+                    },
+                    contentPadding = PaddingValues(horizontal = 16.dp, vertical = 8.dp),
+                ) {
+                    Text("立即更新全部", fontSize = 13.sp)
+                }
+                bulkStatus?.let {
+                    Text(it, color = AppColors.TextMuted, fontSize = 12.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                }
+            }
+            // Result of the most recent refresh — including the silent background sweeps, so an
+            // automatic update is never invisible from the UI.
+            val lastRefresh by appContainer.songlistAutoUpdater.message.collectAsState()
+            lastRefresh?.let {
+                Spacer(Modifier.height(4.dp))
+                Text(
+                    "最近一次：$it",
+                    color = AppColors.TextMuted,
+                    fontSize = 12.sp,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+            }
+            // When the background job is expected to do something. Android may run it later — the
+            // text says so instead of promising an exact minute (spec §7.2).
+            Spacer(Modifier.height(2.dp))
+            Text(
+                "下次预计更新：${songlistDueText(appContainer.songlistAutoUpdater.nextDueAt())}" +
+                    "（自动更新关闭或没有符合条件的歌单时不执行）",
+                color = AppColors.TextMuted,
+                fontSize = 12.sp,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+        }
+
         Section("音频硬件直通") {
             ToggleRow("Hi-Res 硬件直通（播放无损闪退时请关闭）", settings.audioOffloadEnabled) {
                 scope.launch { appContainer.settingsStore.update { it.copy(audioOffloadEnabled = !it.audioOffloadEnabled) } }
+            }
+        }
+
+        Section("跳转播放") {
+            // Not a global playback mode: Walkman stays the default. This only decides which app
+            // the player-screen "跳转播放" button hands the current song to. There is deliberately
+            // no package enumeration here (that would need <queries>): the pick goes through
+            // Android's own chooser and we remember the chosen component.
+            var handoffNotice by remember { mutableStateOf<String?>(null) }
+            var pickerPlayers by remember {
+                mutableStateOf<List<com.walkman.tv.playback.external.ExternalPlayerChoice>>(emptyList())
+            }
+            var showPlayerPicker by remember { mutableStateOf(false) }
+            val savedRef = com.walkman.tv.playback.external.ExternalPlayerRef.parse(
+                settings.defaultHandoffPlayer,
+                settings.defaultHandoffPlayerLabel,
+            )
+            fun notifyHandoff(message: String) {
+                // Always give visible feedback: a remote-driven button that silently does nothing
+                // is indistinguishable from a broken focus chain.
+                handoffNotice = message
+                Toast.makeText(context, message, Toast.LENGTH_SHORT).show()
+            }
+            // Enumerate the TV's real players with the most recent *real* play URL. Deliberately
+            // no placeholder URL: if nothing has been resolved yet we say so instead.
+            fun openPlayerPicker() {
+                val target = appContainer.playbackController.lastExternalTarget()
+                if (target == null) {
+                    notifyHandoff("请先播放一首歌曲后再选择默认播放器")
+                    return
+                }
+                val players = appContainer.externalPlayerLauncher.findPlayers(target.url, target.mimeType)
+                if (players.isEmpty()) {
+                    notifyHandoff("未找到可用的外部播放器")
+                    return
+                }
+                pickerPlayers = players
+                showPlayerPicker = true
+            }
+            TvFocusable(
+                onClick = { openPlayerPicker() },
+                modifier = Modifier.fillMaxWidth(),
+            ) {
+                Row(
+                    modifier = Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 12.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Text(
+                        "默认跳转播放器",
+                        color = AppColors.TextPrimary,
+                        fontSize = 14.sp,
+                        modifier = Modifier.weight(1f),
+                    )
+                    Text(
+                        savedRef?.displayName ?: "未设置",
+                        color = AppColors.AccentGreen,
+                        fontSize = 14.sp,
+                        fontWeight = FontWeight.Bold,
+                    )
+                }
+            }
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                TvPill(onClick = { openPlayerPicker() }) {
+                    Text("更换默认播放器", fontSize = 13.sp)
+                }
+                TvPill(
+                    onClick = {
+                        if (settings.defaultHandoffPlayer == null) {
+                            notifyHandoff("当前没有设置默认播放器")
+                        } else {
+                            scope.launch {
+                                appContainer.settingsStore.update {
+                                    it.copy(defaultHandoffPlayer = null, defaultHandoffPlayerLabel = null)
+                                }
+                                com.walkman.tv.playback.external.ExternalPlayerLog.emitStandalone(
+                                    com.walkman.tv.playback.external.ExternalPlayerLog.EVENT_DEFAULT_CLEARED,
+                                )
+                                notifyHandoff("已清除默认播放器")
+                            }
+                        }
+                    },
+                ) {
+                    Text("清除默认播放器", fontSize = 13.sp)
+                }
+            }
+            handoffNotice?.let {
+                Text(it, color = AppColors.AccentGreen, fontSize = 12.sp)
+            }
+            Text(
+                "开启后详情页会显示「跳转播放」按钮，可将当前歌曲的播放地址交给电视上的其他播放器打开。" +
+                    "该方式会把媒体直链暴露给外部应用。",
+                color = AppColors.TextMuted,
+                fontSize = 12.sp,
+            )
+
+            if (showPlayerPicker) {
+                com.walkman.tv.ui.components.ExternalPlayerPickerDialog(
+                    players = pickerPlayers,
+                    onPick = { ref ->
+                        showPlayerPicker = false
+                        scope.launch {
+                            appContainer.settingsStore.update {
+                                it.copy(defaultHandoffPlayer = ref.componentString, defaultHandoffPlayerLabel = ref.label)
+                            }
+                            com.walkman.tv.playback.external.ExternalPlayerLog.emitSelected(
+                                0L,
+                                ref.packageName,
+                                ref.label,
+                            )
+                            notifyHandoff("已设置默认播放器：" + ref.displayName)
+                        }
+                    },
+                    onDismiss = { showPlayerPicker = false },
+                )
             }
         }
 
@@ -247,6 +451,37 @@ fun SettingsScreen(modifier: Modifier = Modifier) {
                     }
                 }
             }
+        }
+
+        Section("黑胶颜色") {
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                com.walkman.tv.data.store.VinylColor.entries.forEach { color ->
+                    TvPill(
+                        onClick = { scope.launch { appContainer.settingsStore.update { it.copy(vinylColor = color) } } },
+                        selected = settings.vinylColor == color,
+                    ) {
+                        Text(color.label, fontSize = 13.sp)
+                    }
+                }
+            }
+            Spacer(Modifier.height(8.dp))
+            Text(
+                "播放页黑胶唱片的配色，立即生效。默认翠绿（与官方一致），经典黑即本应用此前的黑色唱片外观。",
+                color = AppColors.TextMuted,
+                fontSize = 11.sp,
+            )
+        }
+
+        Section("播放界面") {
+            ToggleRow("播放控件自动隐藏", settings.autoHidePlayerControls) {
+                scope.launch { appContainer.settingsStore.update { it.copy(autoHidePlayerControls = !it.autoHidePlayerControls) } }
+            }
+            Spacer(Modifier.height(8.dp))
+            Text(
+                "开启后，播放页 5 秒无操作自动隐藏进度条和播放按钮，按方向键或确认键重新显示。",
+                color = AppColors.TextMuted,
+                fontSize = 11.sp,
+            )
         }
 
         Section("下载目录") {
@@ -363,22 +598,29 @@ fun SettingsScreen(modifier: Modifier = Modifier) {
                 fontSize = 12.sp,
             )
             Row(verticalAlignment = Alignment.CenterVertically) {
-                OutlinedTextField(
-                    value = url,
-                    onValueChange = { url = it },
-                    singleLine = true,
+                // D-pad focus only draws the ring; the IME comes up on an explicit OK press.
+                TvFocusGatedField(
                     modifier = Modifier.weight(1f),
-                    placeholder = { Text("URL（http://...）或直接粘贴 JS 代码", color = AppColors.TextMuted) },
-                    keyboardOptions = KeyboardOptions(imeAction = ImeAction.Done),
-                    keyboardActions = KeyboardActions(onDone = { importInput(scope, url) { status = it } }),
-                    colors = OutlinedTextFieldDefaults.colors(
-                        focusedTextColor = AppColors.TextPrimary,
-                        unfocusedTextColor = AppColors.TextPrimary,
-                        focusedBorderColor = AppColors.AccentGreen,
-                        unfocusedBorderColor = AppColors.Card,
-                        cursorColor = AppColors.AccentGreen,
-                    ),
-                )
+                    imeAction = ImeAction.Done,
+                    onImeDone = { importInput(scope, url) { status = it } },
+                ) { slot ->
+                    OutlinedTextField(
+                        value = url,
+                        onValueChange = { url = it },
+                        singleLine = true,
+                        modifier = slot.modifier.fillMaxWidth(),
+                        placeholder = { Text("URL（http://...）或直接粘贴 JS 代码", color = AppColors.TextMuted) },
+                        keyboardOptions = slot.keyboardOptions,
+                        keyboardActions = slot.keyboardActions,
+                        colors = OutlinedTextFieldDefaults.colors(
+                            focusedTextColor = AppColors.TextPrimary,
+                            unfocusedTextColor = AppColors.TextPrimary,
+                            focusedBorderColor = AppColors.AccentGreen,
+                            unfocusedBorderColor = AppColors.Card,
+                            cursorColor = AppColors.AccentGreen,
+                        ),
+                    )
+                }
                 Spacer(Modifier.width(8.dp))
                 TvPill(onClick = { importInput(scope, url) { status = it } }, selected = true) { Text("导入", fontSize = 14.sp) }
                 Spacer(Modifier.width(8.dp))
@@ -454,6 +696,8 @@ fun SettingsScreen(modifier: Modifier = Modifier) {
         }
 
         SyncSection()
+
+        DiagnosticsSection()
 
         UpdateSection()
     }
@@ -814,16 +1058,22 @@ private fun SyncSection() {
         Spacer(Modifier.height(4.dp))
         Text("服务地址", color = AppColors.TextSecondary, fontSize = 13.sp)
         Row(verticalAlignment = Alignment.CenterVertically) {
-            OutlinedTextField(
-                value = urlDraft,
-                onValueChange = { urlDraft = it },
-                singleLine = true,
+            TvFocusGatedField(
                 modifier = Modifier.weight(1f),
-                placeholder = { Text("https://example.com/sync", color = AppColors.TextMuted) },
-                keyboardOptions = KeyboardOptions(imeAction = ImeAction.Done),
-                keyboardActions = KeyboardActions(onDone = { persistThen {} }),
-                colors = syncFieldColors(),
-            )
+                imeAction = ImeAction.Done,
+                onImeDone = { persistThen {} },
+            ) { slot ->
+                OutlinedTextField(
+                    value = urlDraft,
+                    onValueChange = { urlDraft = it },
+                    singleLine = true,
+                    modifier = slot.modifier.fillMaxWidth(),
+                    placeholder = { Text("https://example.com/sync", color = AppColors.TextMuted) },
+                    keyboardOptions = slot.keyboardOptions,
+                    keyboardActions = slot.keyboardActions,
+                    colors = syncFieldColors(),
+                )
+            }
             Spacer(Modifier.width(8.dp))
             TvPill(
                 onClick = { keypad = if (keypad == SyncField.Url) null else SyncField.Url },
@@ -835,17 +1085,23 @@ private fun SyncSection() {
         Spacer(Modifier.height(8.dp))
         Text("连接码", color = AppColors.TextSecondary, fontSize = 13.sp)
         Row(verticalAlignment = Alignment.CenterVertically) {
-            OutlinedTextField(
-                value = codeDraft,
-                onValueChange = { codeDraft = it },
-                singleLine = true,
+            TvFocusGatedField(
                 modifier = Modifier.weight(1f),
-                placeholder = { Text("LX Music Sync Server 的连接码", color = AppColors.TextMuted) },
-                visualTransformation = if (showCode) VisualTransformation.None else PasswordVisualTransformation(),
-                keyboardOptions = KeyboardOptions(imeAction = ImeAction.Done),
-                keyboardActions = KeyboardActions(onDone = { persistThen {} }),
-                colors = syncFieldColors(),
-            )
+                imeAction = ImeAction.Done,
+                onImeDone = { persistThen {} },
+            ) { slot ->
+                OutlinedTextField(
+                    value = codeDraft,
+                    onValueChange = { codeDraft = it },
+                    singleLine = true,
+                    modifier = slot.modifier.fillMaxWidth(),
+                    placeholder = { Text("LX Music Sync Server 的连接码", color = AppColors.TextMuted) },
+                    visualTransformation = if (showCode) VisualTransformation.None else PasswordVisualTransformation(),
+                    keyboardOptions = slot.keyboardOptions,
+                    keyboardActions = slot.keyboardActions,
+                    colors = syncFieldColors(),
+                )
+            }
             Spacer(Modifier.width(8.dp))
             TvPill(
                 onClick = { showCode = !showCode },
@@ -955,5 +1211,158 @@ private fun SyncInfoRow(label: String, value: String, valueColor: Color = AppCol
     Row(verticalAlignment = Alignment.CenterVertically) {
         Text(label, color = AppColors.TextSecondary, fontSize = 13.sp)
         Text(value, color = valueColor, fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
+    }
+}
+
+@Composable
+private fun DiagnosticsSection() {
+    var status by remember { mutableStateOf<RunLog.Status?>(null) }
+    var showQr by remember { mutableStateOf(false) }
+    var qrUrl by remember { mutableStateOf("") }
+    var notice by remember { mutableStateOf<String?>(null) }
+    var pendingClear by remember { mutableStateOf(false) }
+    val scope = rememberCoroutineScope()
+
+    // Live status (size / 状态 / 最近错误); RunLog.status() touches the filesystem, so keep it off
+    // the main thread and refresh in the background.
+    LaunchedEffect(Unit) {
+        while (true) {
+            status = withContext(Dispatchers.IO) { appContainer.runLog.status() }
+            delay(2000)
+        }
+    }
+    // The download server is temporary: leaving 设置 stops it and invalidates the token (spec §27).
+    DisposableEffect(Unit) {
+        onDispose { appContainer.stopLogServer() }
+    }
+
+    Section("故障诊断") {
+        Text("运行日志：自动记录", color = AppColors.TextPrimary, fontSize = 14.sp)
+        Text("保存：最近 3 天 · 上限 10 MB", color = AppColors.TextSecondary, fontSize = 13.sp)
+        Text(
+            "当前大小：" + formatLogSize(status?.totalBytes ?: 0L) + " / 10 MB",
+            color = AppColors.TextSecondary,
+            fontSize = 13.sp,
+        )
+        SyncInfoRow("状态：", status?.statusText ?: "正在记录")
+        SyncInfoRow(
+            "最近错误：",
+            status?.lastProblem ?: "无",
+            if (status?.lastProblem == null) AppColors.TextMuted else AppColors.Warning,
+        )
+
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
+            TvPill(
+                onClick = {
+                    scope.launch {
+                        val server = withContext(Dispatchers.IO) { appContainer.startLogServer() }
+                        if (server == null) {
+                            notice = "未检测到局域网地址，请确保电视和手机连接到同一网络。"
+                        } else {
+                            qrUrl = server.pageUrl()
+                            showQr = true
+                            notice = null
+                        }
+                    }
+                },
+                selected = true,
+                contentPadding = PaddingValues(horizontal = 18.dp, vertical = 12.dp),
+            ) { Text("扫码下载日志", fontSize = 13.sp, fontWeight = FontWeight.Bold) }
+            TvPill(
+                onClick = { pendingClear = true },
+                accent = AppColors.Danger,
+                contentPadding = PaddingValues(horizontal = 18.dp, vertical = 12.dp),
+            ) { Text("清除日志", fontSize = 13.sp) }
+        }
+
+        Text(
+            "日志仅保存在本机；扫码后手机浏览器可下载 ZIP（logs/ + device.txt），链接 5 分钟后失效。",
+            color = AppColors.TextMuted,
+            fontSize = 11.sp,
+        )
+        notice?.let { Text(it, color = AppColors.Warning, fontSize = 12.sp) }
+    }
+
+    if (showQr) {
+        QrDialog(
+            url = qrUrl,
+            title = "扫码下载日志",
+            subtitle = "手机扫码打开页面，可下载全部日志或最近 30 分钟",
+            onDismiss = {
+                showQr = false
+                appContainer.stopLogServer()
+            },
+        )
+    }
+
+    if (pendingClear) {
+        ClearLogConfirmDialog(
+            onCancel = { pendingClear = false },
+            onConfirm = {
+                pendingClear = false
+                appContainer.runLog.clear()
+            },
+        )
+    }
+}
+
+@Composable
+private fun ClearLogConfirmDialog(onCancel: () -> Unit, onConfirm: () -> Unit) {
+    val cancelFocus = remember { FocusRequester() }
+    LaunchedEffect(Unit) { runCatching { cancelFocus.requestFocus() } }
+    androidx.compose.ui.window.Dialog(
+        onDismissRequest = onCancel,
+        properties = androidx.compose.ui.window.DialogProperties(usePlatformDefaultWidth = false),
+    ) {
+        Column(
+            modifier = Modifier
+                .width(360.dp)
+                .clip(RoundedCornerShape(16.dp))
+                .background(AppColors.BgPanel)
+                .padding(horizontal = 24.dp, vertical = 22.dp),
+        ) {
+            Text("清除运行日志", color = AppColors.TextPrimary, fontSize = 18.sp, fontWeight = FontWeight.Bold)
+            Spacer(Modifier.height(10.dp))
+            Text(
+                "确定清除运行日志？清除后会从现在重新开始记录。",
+                color = AppColors.TextSecondary,
+                fontSize = 14.sp,
+            )
+            Spacer(Modifier.height(22.dp))
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(12.dp, Alignment.End),
+            ) {
+                TvPill(
+                    onClick = onCancel,
+                    focusRequester = cancelFocus,
+                    contentPadding = PaddingValues(horizontal = 24.dp, vertical = 10.dp),
+                ) { Text("取消", fontSize = 14.sp, fontWeight = FontWeight.SemiBold) }
+                TvPill(
+                    onClick = onConfirm,
+                    selected = true,
+                    accent = AppColors.Danger,
+                    contentPadding = PaddingValues(horizontal = 24.dp, vertical = 10.dp),
+                ) { Text("确定", fontSize = 14.sp, fontWeight = FontWeight.SemiBold) }
+            }
+        }
+    }
+}
+
+private fun formatLogSize(bytes: Long): String = when {
+    bytes < 1024 -> bytes.toString() + " B"
+    bytes < 1024 * 1024 -> String.format(java.util.Locale.US, "%.0f KB", bytes / 1024.0)
+    else -> String.format(java.util.Locale.US, "%.1f MB", bytes / (1024.0 * 1024.0))
+}
+
+/** Coarse "不到 1 分钟 / x 分钟后 / x 小时后 / x 天后" label for the next songlist sweep. */
+private fun songlistDueText(millis: Long?): String {
+    if (millis == null || millis <= 0L) return "未计划"
+    val diff = (millis - System.currentTimeMillis()).coerceAtLeast(0L)
+    return when {
+        diff < 60_000L -> "不到 1 分钟"
+        diff < 3_600_000L -> "${diff / 60_000L} 分钟后"
+        diff < 86_400_000L -> "${diff / 3_600_000L} 小时后"
+        else -> "${diff / 86_400_000L} 天后"
     }
 }

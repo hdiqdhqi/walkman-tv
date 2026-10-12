@@ -18,6 +18,12 @@ class AppEvents {
     )
     val menuKey: SharedFlow<Unit> = _menuKey.asSharedFlow()
 
+    /** Screen-level hook run from [com.walkman.tv.MainActivity.dispatchKeyEvent] before any view
+     *  sees the key — works even when nothing in Compose holds focus (e.g. the player controls are
+     *  auto-hidden, so no focusable node exists to receive D-pad events). Return true to consume.
+     *  Main thread only; the owner clears it when it leaves (upstream `feat/vinyl-refresh-autohide`). */
+    var keyInterceptor: ((android.view.KeyEvent) -> Boolean)? = null
+
     private val _qrSearchKeyword = MutableSharedFlow<String>(
         extraBufferCapacity = 4,
         onBufferOverflow = BufferOverflow.DROP_OLDEST,

@@ -2,6 +2,7 @@ package com.walkman.tv.playback
 
 import android.content.Context
 import android.content.Intent
+import android.content.pm.ApplicationInfo
 import androidx.core.content.ContextCompat
 import androidx.media3.common.AudioAttributes
 import androidx.media3.common.C
@@ -18,19 +19,23 @@ import androidx.media3.exoplayer.audio.DefaultAudioSink
 import com.walkman.tv.data.store.PlaybackSnapshot
 import com.walkman.tv.data.model.Quality
 import com.walkman.tv.data.model.Track
+import com.walkman.tv.playback.external.AudioMime
+import com.walkman.tv.playback.external.ExternalPlaybackTarget
 import com.walkman.tv.source.ResolveOrigin
 import com.walkman.tv.source.ResolvedTrack
 import com.walkman.tv.source.SourceManager
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
-import kotlin.random.Random
+import kotlinx.coroutines.withTimeout
 
 enum class RepeatMode { OFF, ALL, ONE }
 
@@ -76,8 +81,10 @@ class PlaybackController(
      *  to decide which tier to step down from on format-reject errors. */
     private var lastAttemptedQuality: Quality? = null
 
-    /** Number of consecutive network-error retries on the current track. Reset to 0 on a
-     *  successful play, on a fresh playAt(), or once we've given up and skipped to next. */
+    /** Number of consecutive network-error retries on the current track. Reset to 0 on a fresh
+     *  playAt() (qualityCap == null), on the format-cascade path, or once we've given up and
+     *  skipped to next. Must NOT be reset when a retry's resolve succeeds: a URL that resolves
+     *  fine but whose bytes always fail (e.g. HTTP 4xx) would otherwise retry forever. */
     private var networkRetryCount: Int = 0
 
     /** Number of consecutive *tracks* that have failed back-to-back (resolve failed or an
@@ -117,6 +124,13 @@ class PlaybackController(
 
     private val appContext = context.applicationContext
 
+    /** Opt-in structured trace for the auto-next chain; silent on non-debuggable builds. */
+    private val trace = PlaybackTrace(
+        runCatching {
+            (context.applicationInfo.flags and ApplicationInfo.FLAG_DEBUGGABLE) != 0
+        }.getOrDefault(false),
+    )
+
     private companion object {
         /** ExoPlayer error codes that indicate the URL was fetched fine but the bytes can't be
          *  decoded — i.e. a format-level rejection. Spec §3 calls for one-tier cascade here. */
@@ -147,6 +161,12 @@ class PlaybackController(
         /** Stop auto-skipping once this many tracks fail back-to-back (a whole playlist of dead
          *  links shouldn't spin forever). */
         const val MAX_CONSECUTIVE_FAILURES = 3
+
+        /** Hard ceiling for one URL resolve (all scripts, the quality cascade and the cross-source
+         *  fallback included). A single script call already times out at 15s, but a hanging script
+         *  could otherwise be retried for every quality tier - leaving the UI in `resolving` for
+         *  minutes. 30s leaves room for one retry at the next tier before we give up and advance. */
+        const val RESOLVE_TIMEOUT_MS = 30_000L
 
         /**
          * Build the ExoPlayer with settings tuned for music playback on Android TV:
@@ -250,18 +270,58 @@ class PlaybackController(
 
     private var resolveJob: Job? = null
 
+    /** Single-flight guard: only the newest transition may touch [player] or [_state]. */
+    private val transitions = PlaybackTransitionGuard()
+
+    /** Transition id whose MediaItem is currently loaded in [player] (0 = none). */
+    private var mediaItemGen: Long = 0L
+
+    /** Transition id whose STATE_ENDED was already consumed - one ended episode advances once. */
+    private var endedHandledGen: Long = 0L
+
+    /**
+     * URL / quality of the track currently loaded in [player], kept only so the external-player
+     * path can hand the *same* resolved URL to another app without re-resolving (spec 12). Cleared
+     * on [stop]; [lastResolvedTrackId] guards against handing over a URL from a previous track
+     * while a new one is still resolving.
+     */
+    @Volatile private var lastResolvedUrl: String? = null
+    @Volatile private var lastResolvedTrackId: String? = null
+    @Volatile private var lastResolvedQuality: Quality? = null
+
+    /**
+     * Snapshot of the most recently resolved track (url + mime), deliberately NOT cleared by
+     * [stop]: the Settings page needs a *real* URL to enumerate external players with, and it is
+     * often opened after playback stopped. The URL may have expired by then, which is fine — only
+     * its scheme/shape is used for matching.
+     */
+    @Volatile private var lastExternalSnapshot: ExternalPlaybackTarget? = null
+
     init {
         player.addListener(object : Player.Listener {
             override fun onIsPlayingChanged(isPlaying: Boolean) {
                 _state.value = _state.value.copy(isPlaying = isPlaying)
+                trace.step(
+                    mediaItemGen,
+                    if (isPlaying) "PLAYING" else "PAUSED",
+                    "playWhenReady" to player.playWhenReady,
+                    "playerState" to player.playbackState,
+                )
                 // Pause: drop the audio level immediately so the waveform settles instead
                 // of holding whatever amplitude the last decoded chunk reported.
                 if (!isPlaying) _audioLevel.value = 0f
             }
 
             override fun onPlaybackStateChanged(playbackState: Int) {
+                trace.step(
+                    mediaItemGen, "PLAYER_STATE",
+                    "state" to playbackState, "playWhenReady" to player.playWhenReady,
+                )
                 if (playbackState == Player.STATE_ENDED) {
                     if (_state.value.isMv) exitMv() else handleEnded()
+                } else {
+                    // Leaving ENDED (repeat-one restart, new item, stop) re-arms the once-guard.
+                    endedHandledGen = 0L
                 }
                 if (playbackState == Player.STATE_READY) {
                     // A track actually started — clear the consecutive-failure streak.
@@ -271,6 +331,17 @@ class PlaybackController(
             }
 
             override fun onPlayerError(error: PlaybackException) {
+                val gen = mediaItemGen
+                trace.step(
+                    gen, "ERROR",
+                    "code" to error.errorCodeName, "errorCode" to error.errorCode,
+                )
+                if (!transitions.isCurrent(gen)) {
+                    // Error from a media item a newer transition already replaced - never let the
+                    // stale failure stop or advance the track the user is on now.
+                    trace.step(gen, "STALE_DROP", "stage" to "onPlayerError")
+                    return
+                }
                 // Format/codec rejections are the "encrypted .mgg" / "actually MP3 not FLAC" case
                 // from spec §3 — re-cascade from one tier below the current attempt. Network /
                 // unauthorized errors get surfaced as-is.
@@ -289,7 +360,7 @@ class PlaybackController(
                         warning = "${current.displayName} 格式不支持，降级到 ${below.displayName}",
                     )
                     networkRetryCount = 0 // format error path — separate from the network counter
-                    playAt(_state.value.index, qualityCap = below)
+                    playAt(_state.value.index, qualityCap = below, reason = "retry-format")
                     return
                 }
                 // Transient network — exponential backoff retry up to MAX_NETWORK_RETRIES.
@@ -308,11 +379,12 @@ class PlaybackController(
                             error = null,
                         )
                         val trackIdAtRetry = track.id
+                        val genAtRetry = gen
                         scope.launch {
                             kotlinx.coroutines.delay(delayMs)
-                            // Guard: user may have skipped to a different track during the delay.
-                            if (_state.value.currentTrack?.id == trackIdAtRetry) {
-                                playAt(_state.value.index, qualityCap = lastAttemptedQuality)
+                            // Guard: a newer transition (user skip / auto-next) always wins.
+                            if (transitions.isCurrent(genAtRetry) && _state.value.currentTrack?.id == trackIdAtRetry) {
+                                playAt(_state.value.index, qualityCap = lastAttemptedQuality, reason = "retry-network")
                             }
                         }
                         return
@@ -323,11 +395,11 @@ class PlaybackController(
                         "PlaybackController",
                         "network retries exhausted on ${track.name}; skipping to next",
                     )
-                    failAndAdvance("网络不稳定")
+                    failAndAdvance(gen, "网络不稳定")
                     return
                 }
                 // Any other error — this track failed; auto-skip (or stop after too many in a row).
-                failAndAdvance(error.errorCodeName)
+                failAndAdvance(gen, error.errorCodeName)
             }
         })
         startPositionTicker()
@@ -339,7 +411,7 @@ class PlaybackController(
         if (tracks.isEmpty()) return
         consecutiveFailures = 0 // fresh user-initiated queue — start the failure streak over
         _state.value = _state.value.copy(queue = tracks, index = startIndex.coerceIn(0, tracks.size - 1))
-        if (autoPlay) playAt(_state.value.index)
+        if (autoPlay) playAt(_state.value.index, reason = "set-queue")
     }
 
     /** Capture the parts of state we persist across launches. */
@@ -362,12 +434,12 @@ class PlaybackController(
         if (s.queue.isEmpty() || s.currentIndex !in s.queue.indices) return
         // Stage the queue without auto-play first, so the UI shows the track immediately.
         _state.value = _state.value.copy(queue = s.queue, index = s.currentIndex, isPlaying = false)
-        if (s.wasPlaying) playAt(s.currentIndex)
+        if (s.wasPlaying) playAt(s.currentIndex, reason = "restore")
     }
 
     fun playTrack(track: Track) = setQueue(listOf(track), 0, true)
 
-    fun playAt(index: Int, qualityCap: Quality? = null) {
+    fun playAt(index: Int, qualityCap: Quality? = null, reason: String = "select") {
         val track = _state.value.queue.getOrNull(index) ?: return
         // Fresh attempt (no cap) clears the last-attempted memory + the network retry counter;
         // cascade retries (cap != null) keep them so [onPlayerError] can keep stepping down or
@@ -377,6 +449,16 @@ class PlaybackController(
             networkRetryCount = 0
         }
         val effectivePreferred = qualityCap ?: preferredQuality
+        // Single-flight: this request supersedes every resolve / retry / failure-advance still in
+        // flight. Those steps carry their own, now stale, id and are dropped when they land.
+        val gen = transitions.begin()
+        trace.step(
+            gen, "TRANSITION_BEGIN",
+            "reason" to reason, "index" to index, "track" to track.id,
+            "source" to track.source.key, "quality" to effectivePreferred.key,
+            "cap" to qualityCap?.key, "playWhenReady" to player.playWhenReady,
+            "playerState" to player.playbackState,
+        )
         _state.value = _state.value.copy(index = index, resolving = true, error = null, warning = null, isMv = false)
         // Switch lyrics immediately with the metadata — lyrics depend only on the track, not the
         // resolved play URL, so don't make them wait for (or hinge on) a successful audio resolve.
@@ -384,10 +466,12 @@ class PlaybackController(
         if (qualityCap == null) loadLyrics(track)
         resolveJob?.cancel()
         resolveJob = scope.launch {
+            trace.step(gen, "RESOLVE_START", "track" to track.id, "quality" to effectivePreferred.key)
             // Local fast-path: downloaded tracks + SAF-imported tracks skip the online cascade.
             // localUrlResolver is set up at AppContainer init time.
             val localUrl = runCatching { localUrlResolver?.invoke(track) }.getOrNull()
-            val resolved = if (localUrl != null) {
+            val resolved: Result<ResolvedTrack> = if (localUrl != null) {
+                trace.step(gen, "RESOLVE_OK", "origin" to "local")
                 Result.success(
                     ResolvedTrack(
                         url = localUrl,
@@ -397,18 +481,59 @@ class PlaybackController(
                     ),
                 )
             } else {
-                runCatching { sources.resolveMusicURL(track, effectivePreferred) }
-            }
-            runCatching { playResolvedOrFail(track, resolved) }
-                .onFailure { e ->
-                    android.util.Log.e("PlaybackController", "playAt crashed", e)
-                    failAndAdvance(e.message ?: e::class.simpleName ?: "播放出错")
+                try {
+                    val r = withTimeout(RESOLVE_TIMEOUT_MS) { sources.resolveMusicURL(track, effectivePreferred) }
+                    trace.step(gen, "RESOLVE_OK", "origin" to r.origin.label, "quality" to r.quality.key)
+                    Result.success(r)
+                } catch (e: TimeoutCancellationException) {
+                    trace.step(gen, "RESOLVE_TIMEOUT", "afterMs" to RESOLVE_TIMEOUT_MS)
+                    Result.failure(SourceManager.SourceException("解析播放地址超时"))
+                } catch (e: CancellationException) {
+                    // Superseded (or shutting down). Cancellation must unwind: it is NOT a
+                    // playback failure and must never reach the auto-skip path.
+                    trace.step(gen, "RESOLVE_CANCELLED")
+                    throw e
+                } catch (t: Throwable) {
+                    trace.step(gen, "RESOLVE_FAIL", "cause" to (t::class.simpleName ?: "error"), "msg" to t.message)
+                    Result.failure(t)
                 }
+            }
+            // A newer transition owns the player now - drop this result instead of applying it.
+            if (!transitions.isCurrent(gen)) {
+                trace.step(gen, "STALE_DROP", "stage" to "after-resolve")
+                return@launch
+            }
+            try {
+                playResolvedOrFail(track, resolved, gen)
+            } catch (e: CancellationException) {
+                throw e
+            } catch (t: Throwable) {
+                android.util.Log.e("PlaybackController", "playAt crashed", t)
+                failAndAdvance(gen, t.message ?: t::class.simpleName ?: "播放出错")
+            }
         }
     }
 
-    private fun playResolvedOrFail(track: Track, resolved: Result<ResolvedTrack>) {
+    private fun playResolvedOrFail(track: Track, resolved: Result<ResolvedTrack>, gen: Long) {
+        if (!transitions.isCurrent(gen)) {
+            trace.step(gen, "STALE_DROP", "stage" to "before-apply")
+            return
+        }
         resolved.onSuccess { r ->
+                // Remember the exact URL we just handed ExoPlayer so the external-player button can
+                // pass the same (already-working, already-authenticated) URL on without resolving
+                // again. URLs expire, but the user is playing this one right now.
+                lastResolvedUrl = r.url
+                lastResolvedTrackId = track.id
+                lastResolvedQuality = r.quality
+                lastExternalSnapshot = ExternalPlaybackTarget(
+                    track = track,
+                    url = r.url,
+                    mimeType = AudioMime.resolve(r.url, null),
+                    quality = r.quality,
+                    codec = null,
+                    transitionId = gen,
+                )
                 val item = MediaItem.Builder()
                     .setUri(r.url)
                     .setMediaMetadata(
@@ -423,11 +548,10 @@ class PlaybackController(
                 // Remember the tier so onPlayerError can re-cascade from one tier below if
                 // ExoPlayer rejects the file format.
                 lastAttemptedQuality = r.quality
-                // Successful resolve + setMediaItem → reset the network retry counter so the
-                // next track gets a fresh budget.
-                networkRetryCount = 0
                 player.setMediaItem(item)
                 player.prepare()
+                mediaItemGen = gen
+                trace.step(gen, "SET_MEDIA_ITEM", "quality" to r.quality.key, "origin" to r.origin.label)
                 // Fire the file-header probe so the badge can later clamp the claimed tier
                 // down if the bytes turn out to be lower-grade than the script reported.
                 // Spec §5.4: clear current spec first, run async, validate URL is still
@@ -450,17 +574,21 @@ class PlaybackController(
                 // path. Re-enable once a proper MediaNotification.Provider is in place.
                 // ensureService()
                 player.playWhenReady = true
+                trace.step(
+                    gen, "PLAY_INTENT",
+                    "playWhenReady" to player.playWhenReady, "playerState" to player.playbackState,
+                )
                 _state.value = _state.value.copy(
                     resolving = false,
                     warning = r.warning,
                     originLabel = r.origin.label,
                     quality = r.quality,
+                    error = null,
                 )
                 onTrackStarted?.invoke(track)
                 // (lyrics already loaded in playAt when the track switched)
             }.onFailure { e ->
-                // Couldn't get a play URL for this track — auto-skip (or stop after too many).
-                failAndAdvance(e.message ?: "无法播放")
+                failAndAdvance(gen, e.message ?: "无法播放")
             }
     }
 
@@ -470,11 +598,18 @@ class PlaybackController(
      * [MAX_CONSECUTIVE_FAILURES] tracks fail back-to-back. The streak resets when any track
      * reaches READY (see the player listener). Guarded so a user skipping mid-delay wins.
      */
-    private fun failAndAdvance(reason: String) {
+    private fun failAndAdvance(gen: Long, reason: String) {
+        // A newer transition already owns the player - this failure is stale (typically a resolve
+        // we cancelled on purpose). Never let it stop or advance the track the user is on now.
+        if (!transitions.isCurrent(gen)) {
+            trace.step(gen, "STALE_DROP", "stage" to "failAndAdvance", "reason" to reason)
+            return
+        }
         // Stop the stale audio: playAt keeps the previous track playing while it resolves the
         // next one (for gapless switching). If the target failed, that old track would otherwise
         // keep playing — halt it now so a failed switch actually goes silent.
         runCatching { player.stop() }
+        trace.step(gen, "FAIL_ADVANCE", "reason" to reason, "consecutive" to (consecutiveFailures + 1))
         networkRetryCount = 0
         consecutiveFailures++
         if (consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) {
@@ -494,9 +629,11 @@ class PlaybackController(
         val failedId = _state.value.currentTrack?.id
         scope.launch {
             delay(400)
-            // Only auto-advance if we're still parked on the track that failed (the user may
-            // have manually picked another song during the delay).
-            if (_state.value.currentTrack?.id == failedId) next()
+            // Advance only while this transition is still current and the user hasn't picked
+            // another song during the delay.
+            if (transitions.isCurrent(gen) && _state.value.currentTrack?.id == failedId) {
+                advance("auto-next-fail")
+            }
         }
     }
 
@@ -532,34 +669,42 @@ class PlaybackController(
         // song that the UI is already showing.
         val s = _state.value
         if (player.mediaItemCount == 0 && s.queue.isNotEmpty() && s.index in s.queue.indices) {
-            playAt(s.index)
+            playAt(s.index, reason = "toggle-play")
         } else {
             player.play()
         }
     }
 
-    fun next() {
+    /** User-initiated "next" (UI button / remote). Natural end and failure recovery use [advance]. */
+    fun next() = advance("user-next")
+
+    /**
+     * The one place that decides where playback goes next (repeat / shuffle / queue end) and
+     * starts exactly one transition. Shared by the next button, STATE_ENDED and failure recovery
+     * so those paths can never race each other into two transitions.
+     */
+    private fun advance(reason: String) {
         val s = _state.value
         if (s.queue.isEmpty()) return
-        val nextIdx = when {
-            s.shuffle -> if (s.queue.size <= 1) s.index else randomOther(s.index, s.queue.size)
-            s.index + 1 < s.queue.size -> s.index + 1
-            s.repeatMode != RepeatMode.OFF -> 0
-            else -> { player.pause(); return }
+        val nextIdx = PlaybackQueue.nextIndex(s.queue.size, s.index, s.repeatMode, s.shuffle)
+        if (nextIdx == null) {
+            trace.step(
+                transitions.current, "QUEUE_END",
+                "reason" to reason, "index" to s.index, "size" to s.queue.size,
+            )
+            player.pause()
+            return
         }
-        playAt(nextIdx)
+        trace.step(transitions.current, "NEXT_SELECTED", "reason" to reason, "from" to s.index, "to" to nextIdx)
+        playAt(nextIdx, reason = reason)
     }
 
     fun prev() {
         val s = _state.value
         if (s.queue.isEmpty()) return
         if (player.currentPosition > 3000) { player.seekTo(0); return }
-        val prevIdx = when {
-            s.shuffle -> if (s.queue.size <= 1) s.index else randomOther(s.index, s.queue.size)
-            s.index - 1 >= 0 -> s.index - 1
-            else -> s.queue.size - 1
-        }
-        playAt(prevIdx)
+        val prevIdx = PlaybackQueue.prevIndex(s.queue.size, s.index, s.shuffle) ?: return
+        playAt(prevIdx, reason = "user-prev")
     }
 
     fun seekTo(ms: Long) = player.seekTo(ms.coerceAtLeast(0))
@@ -569,6 +714,13 @@ class PlaybackController(
     fun toggleShuffle() { _state.value = _state.value.copy(shuffle = !_state.value.shuffle) }
 
     fun stop() {
+        transitions.invalidate()
+        resolveJob?.cancel()
+        mediaItemGen = 0L
+        endedHandledGen = 0L
+        lastResolvedUrl = null
+        lastResolvedTrackId = null
+        lastResolvedQuality = null
         player.stop()
         player.clearMediaItems()
         _state.value = PlaybackState()
@@ -580,9 +732,12 @@ class PlaybackController(
     /** Play an MV video url on the same player (UI attaches a PlayerView for output). */
     fun playMvUrl(url: String) {
         resolveJob?.cancel()
+        val gen = transitions.begin()
         player.setMediaItem(MediaItem.fromUri(url))
         player.prepare()
+        mediaItemGen = gen
         player.playWhenReady = true
+        trace.step(gen, "MV_PLAY", "playerState" to player.playbackState)
         _state.value = _state.value.copy(isMv = true, resolving = false, error = null)
     }
 
@@ -590,16 +745,109 @@ class PlaybackController(
     fun exitMv() {
         if (!_state.value.isMv) return
         _state.value = _state.value.copy(isMv = false)
-        playAt(_state.value.index)
+        playAt(_state.value.index, reason = "exit-mv")
+    }
+
+    // MARK: - external player
+
+    /**
+     * The URL + best-effort MIME for the track the external player should play, or null when the
+     * current track has not been resolved yet (or we only have a stale URL from a previous track).
+     *
+     * This never mutates playback state and never touches [player]'s queue — the external path is
+     * additive (spec 12 / 22).
+     */
+    fun currentExternalTarget(): ExternalPlaybackTarget? {
+        val s = _state.value
+        val track = s.currentTrack ?: return null
+        val spec = _audioSpec.value
+        val quality = s.quality ?: lastResolvedQuality
+        if (lastResolvedTrackId == track.id && !lastResolvedUrl.isNullOrBlank()) {
+            val url = lastResolvedUrl!!
+            return ExternalPlaybackTarget(
+                track = track,
+                url = url,
+                mimeType = AudioMime.resolve(url, spec?.codec),
+                quality = quality,
+                codec = spec?.codec,
+                transitionId = transitions.current,
+            )
+        }
+        // Downloaded / SAF-imported tracks skip the resolve cascade, so there is no remembered
+        // resolve URL — fall back to the local resolver's URI for this track.
+        val local = runCatching { localUrlResolver?.invoke(track) }.getOrNull() ?: return null
+        return ExternalPlaybackTarget(
+            track = track,
+            url = local,
+            mimeType = AudioMime.resolve(local, spec?.codec),
+            quality = quality,
+            codec = spec?.codec,
+            transitionId = transitions.current,
+        )
+    }
+
+    /**
+     * The most recent real (url, mime) pair, for the Settings "更换默认播放器" entry. Falls back to
+     * the last resolved snapshot once playback has stopped, and is null when nothing has ever been
+     * resolved — the settings page then asks the user to play a song first instead of inventing a
+     * placeholder URL.
+     */
+    fun lastExternalTarget(): ExternalPlaybackTarget? =
+        currentExternalTarget() ?: lastExternalSnapshot?.let {
+            it.copy(mimeType = AudioMime.resolve(it.url, _audioSpec.value?.codec))
+        }
+
+    /**
+     * Pause Walkman's own output before another app takes over the audio path, so the two never
+     * play on top of each other (HDMI/eARC would otherwise mix them). The queue, index and history
+     * are untouched — pressing play later resumes the same track.
+     *
+     * Returns whether Walkman was actually playing, so the caller can restore exactly that state
+     * via [resumeAfterExternal] if the hand-off is dismissed or fails.
+     */
+    fun pauseForExternal(): Boolean {
+        val wasPlaying = runCatching { player.isPlaying }.getOrDefault(false)
+        runCatching { if (player.isPlaying) player.pause() }
+        return wasPlaying
+    }
+
+    /** Undo [pauseForExternal] after a dismissed/failed hand-off. */
+    fun resumeAfterExternal() {
+        runCatching { player.play() }
     }
 
     // MARK: - internals
 
     private fun handleEnded() {
-        if (_state.value.repeatMode == RepeatMode.ONE) {
-            player.seekTo(0); player.play(); return
+        val gen = mediaItemGen
+        if (!transitions.isCurrent(gen)) {
+            trace.step(gen, "ENDED_IGNORED", "why" to "stale-item")
+            return
         }
-        next()
+        if (endedHandledGen == gen) {
+            trace.step(gen, "ENDED_IGNORED", "why" to "duplicate")
+            return
+        }
+        endedHandledGen = gen
+        if (_state.value.resolving) {
+            // A transition is already in flight (usually the user just skipped): let it win.
+            trace.step(gen, "ENDED_IGNORED", "why" to "transition-in-flight")
+            return
+        }
+        if (PlaybackQueue.endedAction(_state.value.repeatMode) == EndedAction.REPEAT_CURRENT) {
+            trace.step(gen, "ENDED", "action" to "repeat-one")
+            // Re-arm immediately: repeat-one restarts the same MediaItem, whose id never changes.
+            // (The advance path keeps the guard, where a duplicate ENDED would skip two tracks.)
+            endedHandledGen = 0L
+            player.seekTo(0)
+            player.play()
+            return
+        }
+        trace.step(
+            gen, "ENDED",
+            "action" to "auto-next", "repeat" to _state.value.repeatMode, "index" to _state.value.index,
+        )
+        advance("auto-next")
     }
 
     private fun loadLyrics(track: Track) {
@@ -617,12 +865,6 @@ class PlaybackController(
         runCatching {
             ContextCompat.startForegroundService(appContext, Intent(appContext, PlaybackService::class.java))
         }
-    }
-
-    private fun randomOther(current: Int, size: Int): Int {
-        var i = current
-        while (i == current) i = Random.nextInt(size)
-        return i
     }
 
     private fun startPositionTicker() {

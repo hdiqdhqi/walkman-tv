@@ -27,18 +27,34 @@ import kotlinx.coroutines.withTimeoutOrNull
  * The LX Sync Server drives the whole list exchange: once the session is up it calls
  * `getEnabledFeatures`, `list_sync_get_md5`, `list_sync_get_sync_mode`, `list_sync_get_list_data`,
  * `list_sync_set_list_data` and finally `list_sync_finished` on *us*. [LxListSyncService] answers
- * those, [SyncRepository]/[SyncApplier] do the data work, and the server's 3-way merge (which we
- * opted into with `skipSnapshot = false`) stays the single source of merge truth.
+ * those, [LxSyncSession]/[LxListMerge] decide what may be written, [SyncRepository]/[SyncApplier] do
+ * the mechanical data work, and [LxListPusher] sends this device's own edits back as the official
+ * `onListSyncAction` calls - the direction that makes the exchange truly two-way. The server's
+ * snapshot merge (which we opted into with `skipSnapshot = false`) keeps doing its half.
  */
 class SyncManager(
     private val settingsStore: SettingsStore,
     private val client: SyncClient,
     private val libraryStore: LibraryStore,
     private val scope: CoroutineScope,
+    /** Where the last agreed state is kept between sessions (see [SyncBaseline]). */
+    private val baselineStore: SyncBaselineStore,
 ) {
     private val repository = SyncRepository(libraryStore)
     private val applier = SyncApplier(libraryStore, repository)
     private val listSync = LxListSyncService(repository, applier) { requestSyncMode(interactiveRun) }
+
+    /**
+     * Delivers this device's own edits as official `onListSyncAction` calls while a session is up.
+     * Only usable once the server reported `list_sync_finished` for this session - the same gate the
+     * official clients use (`moduleReadys.list`).
+     */
+    private val pusher = LxListPusher(
+        libraryStore = libraryStore,
+        baselineStore = baselineStore,
+        isLive = { listSync.moduleReady && client.isReady },
+        send = { action -> client.call(LxListAction.PUSH_METHOD, listOf(LxListAction.encode(action))) },
+    )
 
     private val _state = MutableStateFlow<SyncState>(SyncState.Disconnected)
     val state: StateFlow<SyncState> = _state.asStateFlow()
@@ -108,7 +124,7 @@ class SyncManager(
                 .distinctUntilChanged()
                 .collect { settings ->
                     if (!settings.syncEnabled) {
-                        closeSession()
+                        endSession()
                         activeConfig = null
                         _state.value = SyncState.Disabled
                         _message.value = null
@@ -164,7 +180,7 @@ class SyncManager(
 
     /** Explicit teardown; also used when the user switches sync off. */
     fun disconnect() {
-        closeSession()
+        endSession()
         activeConfig = null
         _state.value = if (settingsStore.settings.value.syncEnabled) {
             SyncState.Disconnected
@@ -216,16 +232,20 @@ class SyncManager(
      * A non-interactive (auto) sync must never block on a TV dialog: when nothing is stored yet it
      * answers `cancel`, marks [needsModeChoice] and lets the caller surface 需要选择同步方式.
      * The server's own message2call timeout is 120s, so an interactive answer respects it too.
+     *
+     * The returned [SyncModeAnswer] also says whether the user was really asked: an answer taken
+     * from the stored default is not a fresh decision and must not switch the merge off for a
+     * session that already has something agreed with this server (spec §5.6).
      */
-    private suspend fun requestSyncMode(interactive: Boolean): String {
+    private suspend fun requestSyncMode(interactive: Boolean): SyncModeAnswer {
         settingsStore.settings.value.syncMode
             ?.takeIf { LxSyncProtocol.isSelectableSyncMode(it) }
-            ?.let { return it }
+            ?.let { return SyncModeAnswer(it, prompted = false) }
 
         if (!interactive) {
             needsModeChoice = true
             Log.i(SyncClient.TAG, "list: sync mode required but never chosen; auto sync will skip")
-            return LxSyncProtocol.SYNC_MODE_CANCEL
+            return SyncModeAnswer(LxSyncProtocol.SYNC_MODE_CANCEL, prompted = false)
         }
 
         val deferred = CompletableDeferred<String>()
@@ -239,7 +259,7 @@ class SyncManager(
             _syncModeRequest.value = null
         }
         if (LxSyncProtocol.isSelectableSyncMode(chosen)) persistSyncMode(chosen)
-        return chosen
+        return SyncModeAnswer(chosen, prompted = true)
     }
 
     /** Stores the user choice so later syncs (and the next app launch) reuse it. Never `cancel`. */
@@ -254,6 +274,22 @@ class SyncManager(
     private suspend fun runSync(interactive: Boolean): SyncResult {
         interactiveRun = interactive
         needsModeChoice = false
+        // The policy for the session that is about to start. It has to be in place before the socket
+        // opens: the server begins calling `list_sync_*` on us the moment the session is up.
+        listSync.beginSession(
+            LxSyncSession(
+                libraryStore = libraryStore,
+                repository = repository,
+                baselineStore = baselineStore,
+                serverId = { activeServerId },
+                onAgreed = { serverView ->
+                    pusher.adoptAgreement(serverView)
+                    // Whatever this device still owes the server (edits made while the merge ran, or
+                    // kept because they are newer than the server's state) goes out right after.
+                    afterSession()
+                },
+            ),
+        )
         val connected = connect(forceNewSession = true)
         if (connected !is SyncResult.Success) return connected
         _state.value = SyncState.Syncing
@@ -315,22 +351,81 @@ class SyncManager(
     }
 
     /**
-     * Auto-sync trigger for *user* library edits. The applier never emits [LibraryStore.changes],
-     * so applying a server action cannot re-trigger a sync here - that is this module's
-     * equivalent of the official `isApplyingRemoteSync` recursion guard.
+     * Watches the local lists: a user edit *and* a real online-songlist refresh are this device's
+     * own change, so both are delivered as an incremental `onListSyncAction` while a session is up.
+     * A change that cannot be pushed (no live session, nothing agreed with this server yet) falls
+     * back to a whole session, which the 自动同步 setting governs. The applier never emits
+     * [LibraryStore.changes], so applying a server action cannot re-trigger a sync here - this
+     * module's equivalent of the official `isApplyingRemoteSync` recursion guard.
      */
     private fun observeLocalChanges() {
         if (autoSyncJob != null) return
         autoSyncJob = scope.launch {
             var pending: Job? = null
-            libraryStore.changes.collect {
+            libraryStore.changes.collect { source ->
                 // Coalesce a burst of edits (e.g. a batch import) into one sync; no polling.
                 pending?.cancel()
                 pending = scope.launch {
-                    delay(AUTO_SYNC_DEBOUNCE_MS)
-                    maybeAutoSync()
+                    val userEdit = source == LibraryStore.ListChangeSource.USER
+                    SyncLog.newChain()
+                    SyncLog.emit(
+                        SyncLog.EVENT_CHANGE_DETECTED,
+                        listOf("source" to if (userEdit) "user" else "online_refresh") +
+                            SyncLog.sizes(libraryStore.syncLists()),
+                    )
+                    // A user edit *and* a real online-songlist refresh are both this device's own
+                    // change, so both are delivered as an incremental official action as soon as a
+                    // session is up - that is the official behaviour and it is the uplink that was
+                    // missing (the refresh used to be swallowed entirely, which is why "我喜欢"
+                    // gained a song on the TV and the server never heard about it, spec §4.1/§4.3).
+                    delay(PUSH_DEBOUNCE_MS)
+                    val delivered = pushLocalEdits(
+                        if (userEdit) TRIGGER_LOCAL_EDIT else TRIGGER_ONLINE_REFRESH,
+                    )
+                    if (!delivered) {
+                        // No live session, or nothing agreed with this server yet: a whole session
+                        // carries the change instead, governed by the 自动同步 setting. An online
+                        // refresh first waits out the settle window it always used, so a burst of
+                        // platform checks cannot start a session each; a user edit stays as immediate
+                        // as the incremental push was. A refresh that only reordered the same songs
+                        // built no action at all, so it neither pushes nor starts a sync (spec §4.3).
+                        if (!userEdit) delay(AUTO_SYNC_DEBOUNCE_MS)
+                        maybeAutoSync()
+                    }
                 }
             }
+        }
+    }
+
+    /**
+     * Sends this device's pending edits as official actions, the way the official clients do.
+     *
+     * Returns true when the change is already delivered (or there was nothing to deliver), false
+     * when the caller should fall back to a full session: no live session to push over, no agreed
+     * baseline yet, or the server refused an action.
+     *
+     * The gate is *waited for*, never skipped: an edit that lands while the post-session flush (or a
+     * whole session) holds it must still be delivered - returning early here would silently lose the
+     * user's change until some unrelated edit came along (spec §7.5).
+     */
+    private suspend fun pushLocalEdits(reason: String): Boolean = gate.withLock {
+        when (pusher.pushPending(reason)) {
+            is LxListPusher.Outcome.Pushed, LxListPusher.Outcome.NoChange -> true
+            // The server rejected an action: do not pretend it was delivered - a full session
+            // re-merges everything and reports the real outcome (spec §6.7).
+            is LxListPusher.Outcome.Failed -> {
+                runSyncGuarded()
+                true
+            }
+            LxListPusher.Outcome.Offline, LxListPusher.Outcome.NoBaseline -> false
+        }
+    }
+
+    /** One deferred attempt to flush local edits after a session (never blocks the session itself). */
+    private fun afterSession() {
+        scope.launch {
+            delay(PUSH_DEBOUNCE_MS)
+            pushLocalEdits(TRIGGER_AFTER_SYNC)
         }
     }
 
@@ -357,6 +452,18 @@ class SyncManager(
         pendingMode = null
         _syncModeRequest.value = null
         listSync.onSessionClosed()
+        client.closeSession()
+    }
+
+    /**
+     * Like [closeSession], but also drops the session policy: the user turned sync off or
+     * disconnected, so no merge/push policy may outlive the connection.
+     */
+    private fun endSession() {
+        pendingMode?.complete(LxSyncProtocol.SYNC_MODE_CANCEL)
+        pendingMode = null
+        _syncModeRequest.value = null
+        listSync.clearSession()
         client.closeSession()
     }
 
@@ -418,5 +525,18 @@ class SyncManager(
 
         /** Coalesce a burst of library edits into one sync; never polls. */
         const val AUTO_SYNC_DEBOUNCE_MS = 20_000L
+
+        /**
+         * A user edit is pushed incrementally, so it only needs to be coalesced against the tap
+         * that follows it - not against a whole sync session.
+         */
+        const val PUSH_DEBOUNCE_MS = 1_500L
+
+        /** `reason` values for the push log lines (spec §6: the five paths stay distinguishable). */
+        const val TRIGGER_LOCAL_EDIT = "local_edit"
+        const val TRIGGER_AFTER_SYNC = "after_sync"
+
+        /** An imported online songlist was re-read: a membership change of it is a local edit too. */
+        const val TRIGGER_ONLINE_REFRESH = "online_refresh"
     }
 }

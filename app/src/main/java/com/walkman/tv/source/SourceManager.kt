@@ -9,6 +9,7 @@ import com.walkman.tv.data.model.UserScript
 import com.walkman.tv.source.builtin.BuiltInResolver
 import com.walkman.tv.source.js.JsScriptRuntime
 import com.walkman.tv.source.js.ScriptHttpClient
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -72,7 +73,7 @@ class SourceManager(
             val first = pickPlayQuality(preferred, track.qualities.toSet(), scriptQs)
             val cascade = qualityCascade(first, track.qualities.toSet(), scriptQs)
             cascade.forEachIndexed { idx, q ->
-                runCatching { resolveViaScript(track, q, ls) }
+                runCatchingNonCancellable { resolveViaScript(track, q, ls) }
                     .onSuccess { url ->
                         val warn = when {
                             scriptIdx > 0 -> "已切换到音源「${ls.script.name}」"
@@ -89,7 +90,7 @@ class SourceManager(
 
         if (fallbackEnabled) {
             val qForFallback = if (track.qualities.contains(preferred)) preferred else (track.qualities.firstOrNull() ?: Quality.K128)
-            runCatching { builtIn.resolve(track, qForFallback) }.getOrNull()?.let { res ->
+            runCatchingNonCancellable { builtIn.resolve(track, qForFallback) }.getOrNull()?.let { res ->
                 return ResolvedTrack(res.url, ResolveOrigin.DirectFallback, qForFallback, res.warning)
             }
         }
@@ -110,7 +111,7 @@ class SourceManager(
                 alt.qualities.toSet(),
                 altLS.capabilities.sources[alt.source]?.qualities?.toSet() ?: emptySet(),
             )
-            runCatching { resolveViaScript(alt, q, altLS) }.getOrNull()?.let { url ->
+            runCatchingNonCancellable { resolveViaScript(alt, q, altLS) }.getOrNull()?.let { url ->
                 val warn = "原 ${track.source.displayName} 源无法获取播放地址，已换到 ${alt.source.displayName}"
                 return ResolvedTrack(url, ResolveOrigin.OtherSource(alt.source), q, warn)
             }
@@ -220,3 +221,20 @@ class SourceManager(
         }
     }
 }
+
+/**
+ * [runCatching] that never swallows coroutine cancellation. A cancelled resolve means the caller
+ * superseded this work; it must unwind the coroutine, not be reported as "this track failed to
+ * resolve" — otherwise a superseded resolve reaches the auto-skip path and stops the newer track.
+ * ([kotlinx.coroutines.withTimeout] timeouts are converted to a normal failure by
+ * [JsScriptRuntime.requestAction] before they can reach here, so a CancellationException here is
+ * always a real supersede/shutdown.)
+ */
+private inline fun <T> runCatchingNonCancellable(block: () -> T): Result<T> =
+    try {
+        Result.success(block())
+    } catch (e: CancellationException) {
+        throw e
+    } catch (t: Throwable) {
+        Result.failure(t)
+    }

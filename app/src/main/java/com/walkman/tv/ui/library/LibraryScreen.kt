@@ -29,6 +29,7 @@ import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Download
 import androidx.compose.material.icons.filled.PlayArrow
+import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
@@ -53,6 +54,10 @@ import androidx.compose.ui.unit.sp
 import androidx.tv.material3.Icon
 import androidx.tv.material3.Text
 import com.walkman.tv.data.model.Playlist
+import com.walkman.tv.data.model.SourceID
+import com.walkman.tv.data.songlist.ImportedSonglist
+import com.walkman.tv.data.songlist.SonglistUpdateOutcome
+import com.walkman.tv.data.songlist.UpdateStatus
 import com.walkman.tv.ui.appContainer
 import com.walkman.tv.ui.components.Artwork
 import com.walkman.tv.ui.components.EmptyHint
@@ -76,6 +81,10 @@ fun LibraryScreen(onOpenPlayer: () -> Unit, modifier: Modifier = Modifier) {
     val love by appContainer.libraryStore.love.collectAsState()
     val history by appContainer.libraryStore.history.collectAsState()
     val userLists by appContainer.libraryStore.userLists.collectAsState()
+    // Origin records are collected (not just read) so the detail pane's 更新/自动更新 row
+    // recomposes when a background refresh updates the bookkeeping.
+    val originRecords by appContainer.importedSonglistStore.records.collectAsState()
+    val refreshingLists by appContainer.songlistAutoUpdater.updating.collectAsState()
 
     var tab by remember { mutableStateOf(TAB_FAVORITES) }
     var showLocalImport by remember { mutableStateOf(false) }
@@ -165,13 +174,20 @@ fun LibraryScreen(onOpenPlayer: () -> Unit, modifier: Modifier = Modifier) {
                         upFocus = activeTabFocus,
                     )
                 } else {
+                    val origin = originRecords[detail.id]
+                        ?: appContainer.songlistAutoUpdater.originFor(detail)
                     PlaylistDetailPane(
                         playlist = detail,
+                        origin = origin,
+                        refreshing = detail.id in refreshingLists,
                         onBack = { detailId = null },
                         onOpenPlayer = onOpenPlayer,
                         onDelete = if (detail.id != Playlist.LOVE) {
                             {
-                                scope.launch { appContainer.libraryStore.deleteList(detail.id) }
+                                scope.launch {
+                                    appContainer.libraryStore.deleteList(detail.id)
+                                    appContainer.importedSonglistStore.remove(detail.id)
+                                }
                                 detailId = null
                             }
                         } else null,
@@ -298,7 +314,10 @@ private fun PlaylistCard(playlist: Playlist, onClick: () -> Unit) {
                 overflow = TextOverflow.Ellipsis,
             )
             Text(
-                "${playlist.tracks.size} 首",
+                // A list imported from a platform shows where it came from — the same lists are the
+                // ones that can be refreshed on demand / automatically.
+                SourceID.fromKey(playlist.source)?.let { "${it.displayName} · ${playlist.tracks.size} 首" }
+                    ?: "${playlist.tracks.size} 首",
                 color = AppColors.TextMuted,
                 fontSize = 11.sp,
             )
@@ -369,13 +388,67 @@ private fun CoverMosaic(urls: List<String?>, modifier: Modifier = Modifier) {
 @Composable
 private fun PlaylistDetailPane(
     playlist: Playlist,
+    origin: ImportedSonglist?,
+    refreshing: Boolean,
     onBack: () -> Unit,
     onOpenPlayer: () -> Unit,
     onDelete: (() -> Unit)?,
 ) {
+    val scope = rememberCoroutineScope()
     val playFocus = remember { FocusRequester() }
     LaunchedEffect(playlist.id) { runCatching { playFocus.requestFocus() } }
     var showBatchDownload by remember { mutableStateOf(false) }
+    // Result of the last manual 更新歌单 tap for *this* list; reset when switching lists.
+    var refreshStatus by remember(playlist.id) { mutableStateOf<String?>(null) }
+    var refreshFailed by remember(playlist.id) { mutableStateOf(false) }
+    // Set when the platform suddenly reported far fewer songs than last time: the mirror is refused
+    // until the user explicitly confirms it (spec §6 异常数量下降保护).
+    var pendingAnomaly by remember(playlist.id) { mutableStateOf<String?>(null) }
+
+    /** Surface one refresh result; shared by a plain tap and the confirmed (anomaly) run. */
+    fun showOutcome(outcome: SonglistUpdateOutcome) {
+        when (outcome) {
+            is SonglistUpdateOutcome.Applied -> {
+                refreshFailed = false
+                refreshStatus = buildString {
+                    append("已更新：新增 ").append(outcome.added).append("、删除 ").append(outcome.removed)
+                    if (outcome.kept > 0) append("、保留本地 ").append(outcome.kept)
+                    append("，共 ").append(outcome.total).append(" 首")
+                }
+            }
+            is SonglistUpdateOutcome.NeedsConfirmation -> {
+                refreshStatus = null
+                pendingAnomaly = outcome.reason
+            }
+            is SonglistUpdateOutcome.Skipped -> {
+                refreshFailed = true
+                refreshStatus = outcome.reason
+            }
+            is SonglistUpdateOutcome.Unchanged -> {
+                refreshFailed = false
+                refreshStatus = "已是最新（${outcome.total} 首）"
+            }
+            is SonglistUpdateOutcome.Failed -> {
+                refreshFailed = true
+                refreshStatus = outcome.message
+            }
+        }
+    }
+
+    fun runUpdate(confirmAnomaly: Boolean) {
+        if (refreshing) return
+        refreshStatus = "正在更新…"
+        refreshFailed = false
+        // App-scoped: leaving the playlist page must not cancel the fetch + write halfway through
+        // (the in-memory library would already be updated while library.json is never saved).
+        // `refreshing` comes from the updater's global in-flight set, so coming back to the page
+        // still shows 更新中…, and the outcome is also recorded in the updater's `message`
+        // (shown under 设置 → 歌单自动更新) plus the run log. Upstream's latest branch makes the
+        // same move for its own refresh entry point.
+        appContainer.appScope.launch {
+            showOutcome(appContainer.songlistAutoUpdater.updateNow(playlist.id, confirmAnomaly))
+        }
+    }
 
     Column(modifier = Modifier.fillMaxSize()) {
         Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.padding(bottom = 12.dp)) {
@@ -421,6 +494,35 @@ private fun PlaylistDetailPane(
                             }
                         }
                     }
+                    if (origin != null) {
+                        TvPill(
+                            onClick = { runUpdate(confirmAnomaly = false) },
+                            selected = !refreshing,
+                            contentPadding = PaddingValues(horizontal = 14.dp, vertical = 7.dp),
+                        ) {
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                Icon(Icons.Filled.Refresh, contentDescription = null, modifier = Modifier.size(14.dp))
+                                Spacer(Modifier.width(4.dp))
+                                Text(if (refreshing) "更新中…" else "更新歌单", fontSize = 12.sp)
+                            }
+                        }
+                        TvPill(
+                            onClick = {
+                                scope.launch {
+                                    appContainer.songlistAutoUpdater.setAutoUpdate(
+                                        listId = playlist.id,
+                                        source = origin.source,
+                                        sourceListId = origin.sourceListId,
+                                        on = !origin.autoUpdate,
+                                    )
+                                }
+                            },
+                            selected = origin.autoUpdate,
+                            contentPadding = PaddingValues(horizontal = 14.dp, vertical = 7.dp),
+                        ) {
+                            Text(if (origin.autoUpdate) "自动更新 开" else "自动更新 关", fontSize = 12.sp)
+                        }
+                    }
                     TvPill(onClick = onBack, contentPadding = PaddingValues(horizontal = 14.dp, vertical = 7.dp)) {
                         Text("返回", fontSize = 12.sp)
                     }
@@ -437,6 +539,66 @@ private fun PlaylistDetailPane(
                             }
                         }
                     }
+                }
+                if (origin != null) {
+                    Spacer(Modifier.padding(top = 6.dp))
+                    Text(
+                        "来源 ${origin.source.displayName} · 上次更新 ${relativeTime(origin.lastUpdatedAt)}" +
+                            if (origin.autoUpdate) " · 自动更新已开启" else " · 自动更新已关闭",
+                        color = AppColors.TextMuted,
+                        fontSize = 11.sp,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                    if (origin.autoUpdate) {
+                        // Android TV background work is best-effort: show the expected time and say
+                        // outright that the system may run it later (spec §7.2).
+                        Text(
+                            "下次预计更新：${untilText(appContainer.songlistAutoUpdater.nextDueAt())}" +
+                                "（后台任务由系统调度，可能延迟）",
+                            color = AppColors.TextMuted,
+                            fontSize = 11.sp,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                        )
+                    }
+                    // Distinguish the two clocks the auto-update keeps: 内容更新时间 (lastUpdatedAt,
+                    // moved only by a real change) and 检查时间 (the platform was read, possibly with
+                    // nothing to write). Only shown when a check happened after the last content
+                    // change, so it never adds noise to a list that was just updated.
+                    val lastCheck = maxOf(origin.lastFetchedAt, origin.lastAttemptAt)
+                    if (lastCheck > origin.lastUpdatedAt) {
+                        Spacer(Modifier.padding(top = 2.dp))
+                        Text(
+                            "上次检查 ${relativeTime(lastCheck)}（内容无变化）",
+                            color = AppColors.TextMuted,
+                            fontSize = 11.sp,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                        )
+                    }
+                }
+                refreshStatus?.let {
+                    Spacer(Modifier.padding(top = 4.dp))
+                    Text(
+                        it,
+                        color = if (refreshFailed) AppColors.Danger else AppColors.AccentGreen,
+                        fontSize = 11.sp,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                }
+                val lastError = origin?.lastError
+                if (lastError != null && refreshStatus == null) {
+                    Spacer(Modifier.padding(top = 4.dp))
+                    Text(
+                        (if (origin?.lastStatus == UpdateStatus.SKIPPED) "上次自动更新已跳过：" else "上次自动更新失败：") +
+                            lastError,
+                        color = AppColors.Danger,
+                        fontSize = 11.sp,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                    )
                 }
             }
         }
@@ -465,6 +627,17 @@ private fun PlaylistDetailPane(
             playlistName = playlist.name,
             tracks = playlist.tracks,
             onDismiss = { showBatchDownload = false },
+        )
+    }
+
+    pendingAnomaly?.let { reason ->
+        AnomalyConfirmDialog(
+            reason = reason,
+            onDismiss = { pendingAnomaly = null },
+            onConfirm = {
+                pendingAnomaly = null
+                runUpdate(confirmAnomaly = true)
+            },
         )
     }
 }
@@ -754,5 +927,77 @@ private fun MissingDownloadRow(
             onClick = onRetry,
             contentPadding = PaddingValues(horizontal = 14.dp, vertical = 8.dp),
         ) { Text("重试", fontSize = 13.sp, fontWeight = FontWeight.SemiBold) }
+    }
+}
+
+/** Coarse "x 分钟前 / x 小时前 / x 天前" label for the imported-playlist refresh bookkeeping. */
+private fun relativeTime(millis: Long): String {
+    if (millis <= 0L) return "从未"
+    val diff = (System.currentTimeMillis() - millis).coerceAtLeast(0L)
+    return when {
+        diff < 60_000L -> "刚刚"
+        diff < 3_600_000L -> "${diff / 60_000L} 分钟前"
+        diff < 86_400_000L -> "${diff / 3_600_000L} 小时前"
+        else -> "${diff / 86_400_000L} 天前"
+    }
+}
+
+/** Coarse "不到 1 分钟 / x 分钟后 / x 小时后 / x 天后" label for the next scheduled refresh. */
+private fun untilText(millis: Long?): String {
+    if (millis == null || millis <= 0L) return "未计划"
+    val diff = (millis - System.currentTimeMillis()).coerceAtLeast(0L)
+    return when {
+        diff < 60_000L -> "不到 1 分钟"
+        diff < 3_600_000L -> "${diff / 60_000L} 分钟后"
+        diff < 86_400_000L -> "${diff / 3_600_000L} 小时后"
+        else -> "${diff / 86_400_000L} 天后"
+    }
+}
+
+/**
+ * Second confirmation before a mirror update that would delete a suspicious number of songs — the
+ * "异常数量下降" guard of spec §6. 取消 is focused first so a stray remote-OK never confirms it.
+ */
+@Composable
+private fun AnomalyConfirmDialog(reason: String, onDismiss: () -> Unit, onConfirm: () -> Unit) {
+    val cancelFocus = remember { FocusRequester() }
+    LaunchedEffect(Unit) { runCatching { cancelFocus.requestFocus() } }
+    androidx.compose.ui.window.Dialog(
+        onDismissRequest = onDismiss,
+        properties = androidx.compose.ui.window.DialogProperties(usePlatformDefaultWidth = false),
+    ) {
+        Column(
+            modifier = Modifier
+                .width(460.dp)
+                .clip(RoundedCornerShape(16.dp))
+                .background(AppColors.BgPanel)
+                .padding(horizontal = 22.dp, vertical = 20.dp),
+        ) {
+            Text("歌单数量异常", color = AppColors.TextPrimary, fontSize = 18.sp, fontWeight = FontWeight.Bold)
+            Spacer(Modifier.size(10.dp))
+            Text(reason, color = AppColors.TextSecondary, fontSize = 14.sp)
+            Spacer(Modifier.size(8.dp))
+            Text(
+                "继续更新会按平台当前内容调整本地歌单（手动添加的歌曲仍会保留）。如果平台只是临时异常，建议稍后再试。",
+                color = AppColors.TextMuted,
+                fontSize = 12.sp,
+            )
+            Spacer(Modifier.size(16.dp))
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(8.dp, Alignment.End),
+            ) {
+                TvPill(
+                    onClick = onDismiss,
+                    focusRequester = cancelFocus,
+                    contentPadding = PaddingValues(horizontal = 18.dp, vertical = 8.dp),
+                ) { Text("取消", fontSize = 13.sp) }
+                TvPill(
+                    onClick = onConfirm,
+                    accent = AppColors.Danger,
+                    contentPadding = PaddingValues(horizontal = 22.dp, vertical = 8.dp),
+                ) { Text("仍然更新", fontSize = 13.sp, fontWeight = FontWeight.SemiBold) }
+            }
+        }
     }
 }

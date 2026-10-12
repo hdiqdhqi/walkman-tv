@@ -27,7 +27,7 @@ class Boards(private val http: CatalogHttp) {
 }
 
 /** Fill per-song covers via Kuwo's artistpicserver (plain-text URL body). */
-internal suspend fun fillKuwoCovers(http: CatalogHttp, tracks: List<Track>): List<Track> = coroutineScope {
+internal suspend fun fillKuwoCovers(http: CatalogHttpLike, tracks: List<Track>): List<Track> = coroutineScope {
     tracks.map { t ->
         async {
             if (t.picURL != null) return@async t

@@ -31,6 +31,7 @@ import androidx.compose.material.icons.filled.Favorite
 import androidx.compose.material.icons.filled.FavoriteBorder
 import androidx.compose.material.icons.filled.Pause
 import androidx.compose.material.icons.filled.PlayArrow
+import androidx.compose.material.icons.automirrored.filled.OpenInNew
 import androidx.compose.material.icons.automirrored.filled.QueueMusic
 import androidx.compose.material.icons.filled.Repeat
 import androidx.compose.material.icons.filled.RepeatOne
@@ -75,8 +76,14 @@ import androidx.tv.material3.Text
 import com.walkman.tv.data.model.Track
 import com.walkman.tv.playback.LyricParser
 import com.walkman.tv.playback.RepeatMode
+import com.walkman.tv.playback.external.ExternalLaunchResult
+import com.walkman.tv.playback.external.ExternalPlaybackTarget
+import com.walkman.tv.playback.external.ExternalPlayerChoice
+import com.walkman.tv.playback.external.ExternalPlayerLog
+import com.walkman.tv.playback.external.ExternalPlayerRef
 import com.walkman.tv.ui.appContainer
 import com.walkman.tv.ui.components.Artwork
+import com.walkman.tv.ui.components.ExternalPlayerPickerDialog
 import com.walkman.tv.ui.components.TvFocusable
 import com.walkman.tv.ui.components.TvPill
 import com.walkman.tv.ui.theme.AppColors
@@ -101,6 +108,95 @@ fun PlayerScreen(onClose: () -> Unit, modifier: Modifier = Modifier) {
 
   var showEqDialog by remember { mutableStateOf(false) }
   var showPicker by remember { mutableStateOf(false) }
+  var handoffTarget by remember { mutableStateOf<ExternalPlaybackTarget?>(null) }
+  var wasPlayingBeforeHandoff by remember { mutableStateOf(false) }
+  var pickerPlayers by remember { mutableStateOf<List<ExternalPlayerChoice>>(emptyList()) }
+  var showHandoffPicker by remember { mutableStateOf(false) }
+
+  fun toast(message: String) {
+    android.widget.Toast.makeText(context, message, android.widget.Toast.LENGTH_SHORT).show()
+  }
+
+  fun forgetDefaultPlayer(reason: String, ref: ExternalPlayerRef? = null) {
+    scope.launch {
+      appContainer.settingsStore.update {
+        it.copy(defaultHandoffPlayer = null, defaultHandoffPlayerLabel = null)
+      }
+    }
+    ExternalPlayerLog.emitStandalone(ExternalPlayerLog.EVENT_DEFAULT_CLEARED, ref?.packageName, ref?.label)
+    toast(reason)
+  }
+
+  /** Walkman's own player list (three probe intents + queryIntentActivities), never the chooser. */
+  fun offerExternalPlayers(target: ExternalPlaybackTarget) {
+    val players = appContainer.externalPlayerLauncher.findPlayers(target.url, target.mimeType)
+    if (players.isEmpty()) {
+      ExternalPlayerLog.emitNoHandler(target.transitionId, target.mimeType)
+      toast("未找到可用的外部播放器")
+      showHandoffPicker = false
+      handoffTarget = null
+      if (wasPlayingBeforeHandoff) controller.resumeAfterExternal()
+      return
+    }
+    pickerPlayers = players
+    showHandoffPicker = true
+  }
+
+  /** The user picked [ref] from our list: remember it and hand the real URL over. */
+  fun launchHandoff(ref: ExternalPlayerRef, target: ExternalPlaybackTarget) {
+    ExternalPlayerLog.emit(ExternalPlayerLog.EVENT_START, target, ref.packageName, ref.label)
+    when (appContainer.externalPlayerLauncher.launch(ref, target.url, target.mimeType)) {
+      ExternalLaunchResult.STARTED -> {
+        ExternalPlayerLog.emit(ExternalPlayerLog.EVENT_SUCCESS, target, ref.packageName, ref.label)
+        ExternalPlayerLog.emitSelected(target.transitionId, ref.packageName, ref.label)
+        scope.launch {
+          appContainer.settingsStore.update {
+            it.copy(defaultHandoffPlayer = ref.componentString, defaultHandoffPlayerLabel = ref.label)
+          }
+        }
+        toast("已交给「${ref.displayName}」播放")
+        showHandoffPicker = false
+        handoffTarget = null
+      }
+      ExternalLaunchResult.START_FAILED -> {
+        // Gone/disabled or refuses the intent → forget it and let the user pick again.
+        ExternalPlayerLog.emit(ExternalPlayerLog.EVENT_START_FAILED, target, ref.packageName, ref.label)
+        forgetDefaultPlayer("启动「${ref.displayName}」失败，请重新选择", ref)
+        offerExternalPlayers(target)
+      }
+    }
+  }
+
+  // "跳转播放": hand the current track to another player. Walkman pauses its own output first so
+  // the two never play on top of each other; the queue/index stay put for when the user returns.
+  fun onExternalPlayerClick() {
+    val target = controller.currentExternalTarget()
+    if (target == null) {
+      toast("歌曲尚未解析完成，请稍候")
+      return
+    }
+    handoffTarget = target
+    wasPlayingBeforeHandoff = controller.pauseForExternal()
+
+    val saved = ExternalPlayerRef.parse(settings.defaultHandoffPlayer, settings.defaultHandoffPlayerLabel)
+    if (saved != null) {
+      ExternalPlayerLog.emit(ExternalPlayerLog.EVENT_DEFAULT_USED, target, saved.packageName, saved.label)
+      ExternalPlayerLog.emit(ExternalPlayerLog.EVENT_START, target, saved.packageName, saved.label)
+      if (appContainer.externalPlayerLauncher.launch(saved, target.url, target.mimeType) ==
+          ExternalLaunchResult.STARTED
+      ) {
+        ExternalPlayerLog.emit(ExternalPlayerLog.EVENT_SUCCESS, target, saved.packageName, saved.label)
+        toast("已交给「${saved.displayName}」播放")
+        handoffTarget = null
+        return
+      }
+      ExternalPlayerLog.emit(ExternalPlayerLog.EVENT_DEFAULT_INVALID, target, saved.packageName, saved.label)
+      forgetDefaultPlayer("默认播放器不可用，请重新选择", saved)
+    } else {
+      ExternalPlayerLog.emit(ExternalPlayerLog.EVENT_START, target, null, null)
+    }
+    offerExternalPlayers(target)
+  }
 
   // 核心自适应算法：获取屏幕物理总高度（DP），彻底摆脱内部组件相互挤压的局限
   val configuration = androidx.compose.ui.platform.LocalConfiguration.current
@@ -108,9 +204,47 @@ fun PlayerScreen(onClose: () -> Unit, modifier: Modifier = Modifier) {
   // 强制将黑胶总盘面尺寸锚定为全屏高度的 67%（大屏自动等比放大，且视觉效果极为饱满）
   val vinylAbsoluteSize = screenHeight * 0.67f
 
-  val wantsFocus = !state.isMv && !showMvQueue && !showEqDialog && !showPicker
+  val wantsFocus = !state.isMv && !showMvQueue && !showEqDialog && !showPicker && !showHandoffPicker
   LaunchedEffect(wantsFocus) {
     if (wantsFocus) tryRequestFocus(playFocus)
+  }
+
+  // 播放控件自动隐藏：空闲 5 秒隐藏进度条 + 控制栏。隐藏后 Compose 内没有焦点，按键只会落到
+  // Activity，所以在 Activity.dispatchKeyEvent 层拦截：方向键 / 确认键只负责唤出控件（吞掉该次
+  // 按键，避免确认键误触暂停）；返回、菜单、媒体键照常放行。
+  var controlsVisible by remember { mutableStateOf(true) }
+  var idleTick by remember { mutableStateOf(0) }
+  val autoHideActive = settings.autoHidePlayerControls && wantsFocus
+  LaunchedEffect(autoHideActive, controlsVisible, idleTick) {
+    if (!autoHideActive) {
+      controlsVisible = true
+      return@LaunchedEffect
+    }
+    if (controlsVisible) {
+      delay(AUTO_HIDE_MS)
+      controlsVisible = false
+    }
+  }
+  androidx.compose.runtime.DisposableEffect(autoHideActive) {
+    val events = appContainer.events
+    // 唤出控件那一次按键的后续（长按重复 + 抬起）也吞掉，否则抬起时焦点已在播放键上会触发暂停。
+    var wakeKey: Int? = null
+    val interceptor: (android.view.KeyEvent) -> Boolean = interceptor@{ e ->
+      idleTick++
+      if (e.keyCode == wakeKey) {
+        if (e.action == android.view.KeyEvent.ACTION_UP) wakeKey = null
+        return@interceptor true
+      }
+      if (controlsVisible || e.keyCode !in WAKE_KEYS) return@interceptor false
+      if (e.action == android.view.KeyEvent.ACTION_DOWN) {
+        wakeKey = e.keyCode
+        controlsVisible = true
+        scope.launch { tryRequestFocus(playFocus) }
+      }
+      true
+    }
+    if (autoHideActive) events.keyInterceptor = interceptor
+    onDispose { if (events.keyInterceptor === interceptor) events.keyInterceptor = null }
   }
 
   BackHandler(enabled = true) {
@@ -194,6 +328,7 @@ fun PlayerScreen(onClose: () -> Unit, modifier: Modifier = Modifier) {
           VinylDisc(
             picURL = track.picURL,
             isPlaying = state.isPlaying,
+            palette = vinylPalette(settings.vinylColor),
             modifier = Modifier.fillMaxSize()
           )
         }
@@ -207,50 +342,56 @@ fun PlayerScreen(onClose: () -> Unit, modifier: Modifier = Modifier) {
         modifier = Modifier.fillMaxWidth().height(40.dp),
       )
       Spacer(Modifier.height(6.dp))
-      ProgressBar(state.positionMs, state.durationMs, onSeek = { controller.seekTo(it) })
-      Spacer(Modifier.height(14.dp))
-      val audioSpec by controller.audioSpec.collectAsState()
-      TransportBar(
-        state = state,
-        love = love,
-        audioSpec = audioSpec,
-        onTogglePlay = { controller.togglePlay() },
-        onPrev = { controller.prev() },
-        onNext = { controller.next() },
-        onCycleRepeat = {
-          val mode = state.repeatMode
-          val shuffle = state.shuffle
-          when {
-            mode == RepeatMode.ALL && !shuffle -> {
-              controller.setRepeatMode(RepeatMode.ONE)
-            }
-            mode == RepeatMode.ONE && !shuffle -> {
-              controller.setRepeatMode(RepeatMode.ALL)
-              if (!state.shuffle) controller.toggleShuffle()
-            }
-            else -> {
-              controller.setRepeatMode(RepeatMode.ALL)
-              if (state.shuffle) controller.toggleShuffle()
-            }
-          }
-        },
-        onToggleFav = { showPicker = true },
-        onMv = {
-          android.widget.Toast.makeText(context, "正在获取 MV…", android.widget.Toast.LENGTH_SHORT).show()
-          scope.launch {
-            val info = runCatching { appContainer.mvResolver.getMvUrl(track) }.getOrNull()
-            val url = info?.bestUrl()
-            if (url != null) {
-              controller.playMvUrl(url)
-            } else {
-              android.widget.Toast.makeText(context, "暂无可用 MV", android.widget.Toast.LENGTH_SHORT).show()
-            }
-          }
-        },
-        onShowQueue = { showMvQueue = true },
-        onTuneClick = { showEqDialog = true },
-        playFocusRequester = playFocus,
-      )
+      AnimatedVisibility(visible = controlsVisible) {
+        Column {
+          Spacer(Modifier.height(6.dp))
+          ProgressBar(state.positionMs, state.durationMs, onSeek = { controller.seekTo(it) })
+          Spacer(Modifier.height(14.dp))
+          val audioSpec by controller.audioSpec.collectAsState()
+          TransportBar(
+            state = state,
+            love = love,
+            audioSpec = audioSpec,
+            onTogglePlay = { controller.togglePlay() },
+            onPrev = { controller.prev() },
+            onNext = { controller.next() },
+            onCycleRepeat = {
+              val mode = state.repeatMode
+              val shuffle = state.shuffle
+              when {
+                mode == RepeatMode.ALL && !shuffle -> {
+                  controller.setRepeatMode(RepeatMode.ONE)
+                }
+                mode == RepeatMode.ONE && !shuffle -> {
+                  controller.setRepeatMode(RepeatMode.ALL)
+                  if (!state.shuffle) controller.toggleShuffle()
+                }
+                else -> {
+                  controller.setRepeatMode(RepeatMode.ALL)
+                  if (state.shuffle) controller.toggleShuffle()
+                }
+              }
+            },
+            onToggleFav = { showPicker = true },
+            onMv = {
+              android.widget.Toast.makeText(context, "正在获取 MV…", android.widget.Toast.LENGTH_SHORT).show()
+              scope.launch {
+                val info = runCatching { appContainer.mvResolver.getMvUrl(track) }.getOrNull()
+                val url = info?.bestUrl()
+                if (url != null) {
+                  controller.playMvUrl(url)
+                } else {
+                  android.widget.Toast.makeText(context, "暂无可用 MV", android.widget.Toast.LENGTH_SHORT).show()
+                }
+              }
+            },
+            onShowQueue = { showMvQueue = true },
+            onTuneClick = { showEqDialog = true },
+            onExternalPlayer = { onExternalPlayerClick() },
+            playFocusRequester = playFocus,
+          )
+        }
+      }
     }
 
     MvQueueDrawer(
@@ -270,23 +411,87 @@ fun PlayerScreen(onClose: () -> Unit, modifier: Modifier = Modifier) {
         onDismiss = { showPicker = false },
       )
     }
+    if (showHandoffPicker) {
+      ExternalPlayerPickerDialog(
+        players = pickerPlayers,
+        onPick = { ref -> handoffTarget?.let { launchHandoff(ref, it) } },
+        onDismiss = {
+          showHandoffPicker = false
+          handoffTarget = null
+          if (wasPlayingBeforeHandoff) controller.resumeAfterExternal()
+        },
+      )
+    }
   }
 }
 
 // ============== Vinyl disc (去除了中心小黑洞，封面直达圆心) =====================================================================
 
 /**
- * Fixed black-vinyl palette. The disc never follows the album cover or the theme accent, so it
- * stays a classic black record instead of being tinted green/blue/red per song.
+ * Vinyl disc palette: disc base / radial body gradient / groove lines / rim rings / outer glow.
+ * The disc never follows the album cover, only the user's 黑胶颜色 choice (Settings.vinylColor).
+ *
+ * [groove] is a separate slot because a black record needs *light* grooves to stay readable while
+ * the coloured discs use black ones — upstream hard-coded `Color.Black` there.
  */
-private val VinylBase = Color(0xFF0E0E0E)
-private val VinylMid = Color(0xFF161616)
-private val VinylRim = Color(0xFF1F1F1F)
-private val VinylGroove = Color(0xFF9E9E9E)
-private val VinylHighlight = Color(0xFF3C3C3C)
+internal class VinylPalette(
+  val base: Color,
+  val body: List<Color>,
+  val groove: Color,
+  val rim: Color,
+  val glow: Color,
+  val glowStrength: Float = 1f,
+)
+
+internal fun vinylPalette(color: com.walkman.tv.data.store.VinylColor): VinylPalette = when (color) {
+  // 翠绿 is the upstream default and the upstream original look: green disc, green rim ring and a
+  // strong green halo.
+  com.walkman.tv.data.store.VinylColor.GREEN -> VinylPalette(
+    base = Color(0xFF0E2818),
+    body = listOf(Color(0xFF0A1F12), Color(0xFF112F1C), Color(0xFF1B4528)),
+    groove = Color.Black,
+    rim = AppColors.AccentGreen,
+    glow = AppColors.AccentGreen,
+  )
+  // 经典黑 reproduces exactly what this build rendered before the choice existed (the previous
+  // fixed palette: 0E0E0E / 161616 / 1F1F1F record + 9E9E9E grooves and 3C3C3C rings).
+  com.walkman.tv.data.store.VinylColor.BLACK -> VinylPalette(
+    base = Color(0xFF0E0E0E),
+    body = listOf(Color(0xFF0E0E0E), Color(0xFF161616), Color(0xFF1F1F1F)),
+    groove = Color(0xFF9E9E9E),
+    rim = Color(0xFF3C3C3C),
+    glow = Color(0xFF161616),
+  )
+  com.walkman.tv.data.store.VinylColor.RED -> VinylPalette(
+    base = Color(0xFF2A0D12),
+    body = listOf(Color(0xFF1E080C), Color(0xFF341018), Color(0xFF4E1A24)),
+    groove = Color.Black,
+    rim = Color(0xFFE0566B),
+    glow = Color(0xFFE0566B),
+  )
+  com.walkman.tv.data.store.VinylColor.BLUE -> VinylPalette(
+    base = Color(0xFF0C1A2E),
+    body = listOf(Color(0xFF081222), Color(0xFF102440), Color(0xFF1A365C)),
+    groove = Color.Black,
+    rim = Color(0xFF5B9BFF),
+    glow = Color(0xFF5B9BFF),
+  )
+  com.walkman.tv.data.store.VinylColor.GOLD -> VinylPalette(
+    base = Color(0xFF2A1E08),
+    body = listOf(Color(0xFF1E1505), Color(0xFF35260A), Color(0xFF4F3A12)),
+    groove = Color.Black,
+    rim = Color(0xFFE8B04A),
+    glow = Color(0xFFE8B04A),
+  )
+}
 
 @Composable
-private fun VinylDisc(picURL: String?, isPlaying: Boolean, modifier: Modifier = Modifier) {
+private fun VinylDisc(
+  picURL: String?,
+  isPlaying: Boolean,
+  palette: VinylPalette,
+  modifier: Modifier = Modifier,
+) {
   val rotation = remember { Animatable(0f) }
   LaunchedEffect(isPlaying) {
     if (isPlaying) {
@@ -301,7 +506,7 @@ private fun VinylDisc(picURL: String?, isPlaying: Boolean, modifier: Modifier = 
   val circle = androidx.compose.foundation.shape.CircleShape
 
   Box(modifier = modifier.aspectRatio(1f), contentAlignment = Alignment.Center) {
-    // 1) 外圈暗色光晕 (填满全尺寸) - 固定黑色系，不跟随专辑封面或主题强调色
+    // 1) 外圈光晕 (填满全尺寸) - 颜色随黑胶配色，不跟随专辑封面
     Box(
       modifier = Modifier
         .fillMaxSize()
@@ -309,8 +514,8 @@ private fun VinylDisc(picURL: String?, isPlaying: Boolean, modifier: Modifier = 
         .background(
           Brush.radialGradient(
             colors = listOf(
-              VinylMid.copy(alpha = 0.55f),
-              VinylBase.copy(alpha = 0.20f),
+              palette.glow.copy(alpha = 0.55f * palette.glowStrength),
+              palette.glow.copy(alpha = 0.20f * palette.glowStrength),
               Color.Transparent,
             ),
           ),
@@ -324,7 +529,7 @@ private fun VinylDisc(picURL: String?, isPlaying: Boolean, modifier: Modifier = 
         .graphicsLayer { rotationZ = rotation.value },
       contentAlignment = Alignment.Center,
     ) {
-      VinylGrooves(modifier = Modifier.fillMaxSize())
+      VinylGrooves(palette, modifier = Modifier.fillMaxSize())
 
       // 3) 内圈专辑封面 (比例计算：220 / 300 ≈ 73.33%)
       // 优化：封面图现在无缝延伸到轴心最中心，不再被黑色块覆盖
@@ -343,7 +548,7 @@ private fun VinylDisc(picURL: String?, isPlaying: Boolean, modifier: Modifier = 
 }
 
 @Composable
-private fun VinylGrooves(modifier: Modifier) {
+private fun VinylGrooves(palette: VinylPalette, modifier: Modifier) {
   androidx.compose.foundation.Canvas(modifier = modifier.aspectRatio(1f)) {
     val center = androidx.compose.ui.geometry.Offset(size.width / 2f, size.height / 2f)
     val outerRadius = size.minDimension / 2f
@@ -351,15 +556,11 @@ private fun VinylGrooves(modifier: Modifier) {
 
     val baseScale = outerRadius / 150.dp.toPx()
 
-    drawCircle(color = VinylBase, radius = outerRadius, center = center)
+    drawCircle(color = palette.base, radius = outerRadius, center = center)
 
     drawCircle(
       brush = Brush.radialGradient(
-        colors = listOf(
-          VinylBase,
-          VinylMid,
-          VinylRim,
-        ),
+        colors = palette.body,
         center = center,
         radius = outerRadius,
       ),
@@ -374,7 +575,7 @@ private fun VinylGrooves(modifier: Modifier) {
       val alpha = 0.20f + 0.10f * ((i % 5) / 5f)
       val w = (if (i % 7 == 0) 1.2.dp.toPx() else 0.6.dp.toPx()) * baseScale
       drawCircle(
-        color = VinylGroove.copy(alpha = alpha * 0.30f),
+        color = palette.groove.copy(alpha = alpha * 0.30f),
         radius = r,
         center = center,
         style = androidx.compose.ui.graphics.drawscope.Stroke(width = w),
@@ -383,14 +584,14 @@ private fun VinylGrooves(modifier: Modifier) {
 
     // Low-brightness grey highlights: keeps the record's edge readable on a black disc.
     drawCircle(
-      color = VinylHighlight.copy(alpha = 0.45f),
+      color = palette.rim.copy(alpha = 0.45f),
       radius = innerRadius + 2.dp.toPx() * baseScale,
       center = center,
       style = androidx.compose.ui.graphics.drawscope.Stroke(width = 1.5.dp.toPx() * baseScale),
     )
 
     drawCircle(
-      color = VinylHighlight.copy(alpha = 0.55f),
+      color = palette.rim.copy(alpha = 0.55f),
       radius = outerRadius - 1.dp.toPx() * baseScale,
       center = center,
       style = androidx.compose.ui.graphics.drawscope.Stroke(width = 2.dp.toPx() * baseScale),
@@ -480,6 +681,7 @@ private fun TransportBar(
   onMv: () -> Unit,
   onShowQueue: () -> Unit,
   onTuneClick: () -> Unit,
+  onExternalPlayer: () -> Unit,
   playFocusRequester: FocusRequester? = null,
 ) {
   val track = state.currentTrack
@@ -488,6 +690,8 @@ private fun TransportBar(
   val repeatFocus = remember { FocusRequester() }
   val mvFocus = remember { FocusRequester() }
   val faveFocus = remember { FocusRequester() }
+  val externalFocus = remember { FocusRequester() }
+  val queueFocus = remember { FocusRequester() }
   val hasQuality = state.quality != null
 
   Box(modifier = Modifier.fillMaxWidth()) {
@@ -560,10 +764,28 @@ private fun TransportBar(
       verticalAlignment = Alignment.CenterVertically,
       horizontalArrangement = Arrangement.spacedBy(8.dp),
     ) {
+      // "跳转播放": manual hand-off of the current track to another TV player. Icon + text so it
+      // reads at 3m; it never starts anything on its own.
+      TvPill(
+        onClick = onExternalPlayer,
+        focusRequester = externalFocus,
+        modifier = Modifier.focusProperties { left = faveFocus; right = mvFocus },
+        contentPadding = androidx.compose.foundation.layout.PaddingValues(horizontal = 14.dp, vertical = 8.dp),
+      ) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+          Icon(
+            Icons.AutoMirrored.Filled.OpenInNew,
+            contentDescription = null,
+            modifier = Modifier.size(14.dp),
+          )
+          Spacer(Modifier.width(6.dp))
+          Text("跳转播放", fontSize = 12.sp, fontWeight = FontWeight.Bold)
+        }
+      }
       TvPill(
         onClick = onMv,
         focusRequester = mvFocus,
-        modifier = Modifier.focusProperties { left = faveFocus },
+        modifier = Modifier.focusProperties { left = externalFocus; right = queueFocus },
         contentPadding = androidx.compose.foundation.layout.PaddingValues(horizontal = 14.dp, vertical = 8.dp),
       ) {
         Text("MV", fontSize = 12.sp, fontWeight = FontWeight.Bold)
@@ -571,12 +793,24 @@ private fun TransportBar(
       IconPill(
         Icons.AutoMirrored.Filled.QueueMusic,
         onClick = onShowQueue,
-        modifier = Modifier.focusProperties { right = FocusRequester.Cancel },
+        focusRequester = queueFocus,
+        modifier = Modifier.focusProperties { left = mvFocus; right = FocusRequester.Cancel },
       )
     }
   }
 }
 
+private const val AUTO_HIDE_MS = 5_000L
+/** 控件隐藏时用来唤出控件的键：方向键 + 确认键。 */
+private val WAKE_KEYS = setOf(
+  android.view.KeyEvent.KEYCODE_DPAD_UP,
+  android.view.KeyEvent.KEYCODE_DPAD_DOWN,
+  android.view.KeyEvent.KEYCODE_DPAD_LEFT,
+  android.view.KeyEvent.KEYCODE_DPAD_RIGHT,
+  android.view.KeyEvent.KEYCODE_DPAD_CENTER,
+  android.view.KeyEvent.KEYCODE_ENTER,
+  android.view.KeyEvent.KEYCODE_NUMPAD_ENTER,
+)
 private const val SCRUB_TAP_MS = 220L
 private const val SCRUB_TAP_STEP_MS = 5_000L
 private const val SCRUB_BASE_PER_SEC = 6_000f

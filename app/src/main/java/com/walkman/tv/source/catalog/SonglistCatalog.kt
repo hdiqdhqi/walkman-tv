@@ -2,16 +2,22 @@ package com.walkman.tv.source.catalog
 
 import com.walkman.tv.data.model.Quality
 import com.walkman.tv.data.model.SonglistDetail
+import com.walkman.tv.data.model.SonglistFetchResult
 import com.walkman.tv.data.model.SonglistInfo
 import com.walkman.tv.data.model.SonglistOrder
 import com.walkman.tv.data.model.SonglistTag
 import com.walkman.tv.data.model.SonglistTagGroup
 import com.walkman.tv.data.model.SourceID
 import com.walkman.tv.data.model.Track
+import com.walkman.tv.data.model.OnlinePlaylistException
+import com.walkman.tv.data.online.OnlinePlaylistLog
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
+import org.json.JSONArray
 import org.json.JSONObject
+import java.util.concurrent.atomic.AtomicInteger
+import kotlin.coroutines.cancellation.CancellationException
 
 interface SonglistService {
     val source: SourceID
@@ -20,10 +26,38 @@ interface SonglistService {
     suspend fun fetchRecommended(order: SonglistOrder, tag: SonglistTag, page: Int): List<SonglistInfo>
     suspend fun fetchDetail(list: SonglistInfo): SonglistDetail
     suspend fun search(keyword: String, page: Int): List<SonglistInfo> = emptyList()
+
+    /**
+     * Fetch the **complete** playlist, reporting progress as `(fetched, declaredTotal?)`.
+     *
+     * [fetchDetail] is a single request and is fine for browsing, but no platform hands back a whole
+     * long playlist in one answer, and each one truncates differently (all verified against the live
+     * APIs on 2026-10-12 - see the per-platform overrides):
+     *  - 网易云: `api/v6/playlist/detail` carries the complete `trackIds` but caps the `tracks`
+     *    array, so the objects come from batched `/api/song/detail` calls;
+     *  - QQ: `fcg_ucc_getcdinfo_byids_cp` embeds only the songs it feels like, so pages come from
+     *    `musicu.fcg` with `song_begin` / `song_num`;
+     *  - 酷我: `pl.svc` stops at `rn` songs, so it pages on `pn`;
+     *  - 酷狗: the `single/<id>` page embeds the whole list, but the per-song detail call is batched
+     *    and any batch can fail halfway.
+     *
+     * Implementations must set [SonglistFetchResult.complete] to false when any page/chunk request
+     * failed, and must throw [OnlinePlaylistException] when the list cannot be read at all - a
+     * half-read list must never be written over the local copy as if it were the whole playlist.
+     */
+    suspend fun fetchAll(
+        list: SonglistInfo,
+        onProgress: (fetched: Int, total: Int?) -> Unit = { _, _ -> },
+    ): SonglistFetchResult {
+        val detail = fetchDetail(list)
+        val total = detail.tracks.size.takeIf { it > 0 }
+        onProgress(detail.tracks.size, total)
+        return SonglistFetchResult(detail.info, detail.tracks, total, complete = true)
+    }
 }
 
 /** Songlist (歌单) plaza via each platform's API, ported from iOS `Songlists`. */
-class Songlists(private val http: CatalogHttp) {
+class Songlists(private val http: CatalogHttpLike) {
     private val services = listOf(
         KuwoSonglist(http), NetEaseSonglist(http), KugouSonglist(http), QQSonglist(http),
     )
@@ -45,7 +79,7 @@ private const val KG_CONCEPT_SIGNKEY = "NVPh5oo715z5DIWAeQlhMDsWXXQV4hwt"
 
 // MARK: - Kuwo
 
-private class KuwoSonglist(private val http: CatalogHttp) : SonglistService {
+internal class KuwoSonglist(private val http: CatalogHttpLike) : SonglistService {
     override val source = SourceID.KW
     override val orders = listOf(SonglistOrder("new", "最新"), SonglistOrder("hot", "最热"))
 
@@ -117,20 +151,116 @@ private class KuwoSonglist(private val http: CatalogHttp) : SonglistService {
     }
 
     override suspend fun fetchDetail(list: SonglistInfo): SonglistDetail {
-        val url = "http://nplserver.kuwo.cn/pl.svc?op=getlistinfo&pid=${list.id}&pn=0&rn=300&encode=utf8&keyset=pl2012&identity=kuwo&pcmp4=1&vipver=MUSIC_9.0.5.0_W1&newver=1"
-        val json = runCatching { JSONObject(http.getText(url, mapOf("User-Agent" to UA))) }.getOrNull()
-            ?: return SonglistDetail(list, emptyList())
-        if (json.optString("result") != "ok") return SonglistDetail(list, emptyList())
-        val ml = json.optJSONArray("musiclist") ?: return SonglistDetail(list, emptyList())
+        val page = fetchPage(list, 0) ?: return SonglistDetail(list, emptyList())
+        return SonglistDetail(page.info(list), page.tracks)
+    }
+
+    /**
+     * All-pages Kuwo fetch.
+     *
+     * One `pl.svc` answer is capped at `rn` songs and pages with `pn` (verified against the live
+     * API on 2026-10-12: a 444-song list answers 300 songs for `pn=0`, 144 for `pn=1`, 0 for `pn=2`,
+     * and always reports the true `total=444`). The old single-shot read therefore imported long
+     * lists silently truncated *and* called the result complete - a mirror update then deleted the
+     * songs it had never fetched.
+     */
+    override suspend fun fetchAll(
+        list: SonglistInfo,
+        onProgress: (fetched: Int, total: Int?) -> Unit,
+    ): SonglistFetchResult {
+        val tracks = ArrayList<Track>()
+        var info = list
+        var declared: Int? = null
+        var complete = true
+        var page = 0
+        while (true) {
+            val result = fetchPage(list, page)
+            if (result == null) {
+                complete = false
+                break
+            }
+            declared = result.total ?: declared
+            if (page == 0) info = result.info(list)
+            if (result.tracks.isEmpty()) break
+            tracks += result.tracks
+            onProgress(tracks.size, declared)
+            if (declared != null && tracks.size >= declared) break
+            if (result.tracks.size < KUWO_PAGE_SIZE) break
+            page++
+            if (page > KUWO_MAX_PAGES) break
+        }
+        if (tracks.isEmpty()) {
+            // Kuwo answers `result:"ok"` with an empty `musiclist` for a missing id as well (verified
+            // live), so an empty answer can never be read as "the playlist is now empty".
+            throw OnlinePlaylistException(
+                OnlinePlaylistException.Kind.EMPTY,
+                "kuwo playlist has no songs (total=${declared ?: 0})",
+                null,
+                SourceID.KW,
+            )
+        }
+        // The platform's own count is the completeness check: stopping short of `total` without the
+        // last page being short/failed means we did not see the whole list, and a mirror update must
+        // not treat "the songs I could not fetch" as "songs the user deleted from the playlist".
+        if (declared != null && tracks.size < declared) complete = false
+        return SonglistFetchResult(info.copy(trackCount = declared ?: tracks.size), tracks, declared, complete)
+    }
+
+    /**
+     * One `pl.svc` page. Returns null only for a *later* page that failed (a partial read); the
+     * first page rethrows so the caller sees the real category instead of a fake empty playlist.
+     */
+    private suspend fun fetchPage(list: SonglistInfo, page: Int): KuwoPage? {
+        val url = "http://nplserver.kuwo.cn/pl.svc?op=getlistinfo&pid=${list.id}&pn=$page&rn=$KUWO_PAGE_SIZE" +
+            "&encode=utf8&keyset=pl2012&identity=kuwo&pcmp4=1&vipver=MUSIC_9.0.5.0_W1&newver=1"
+        val text = try {
+            http.getText(url, mapOf("User-Agent" to UA))
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            if (page == 0) throw e else return null
+        }
+        val json = try {
+            parseCatalogJson(text, SourceID.KW, "playlist detail p$page")
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            if (page == 0) throw e else return null
+        }
+        if (json.optString("result") != "ok") {
+            throw OnlinePlaylistException(
+                if (json.has("musiclist")) OnlinePlaylistException.Kind.PARSE
+                else OnlinePlaylistException.Kind.NOT_FOUND,
+                "kuwo result=${json.optString("result")}",
+                null,
+                SourceID.KW,
+            )
+        }
+        val ml = json.optJSONArray("musiclist")
+            ?: throw OnlinePlaylistException(
+                OnlinePlaylistException.Kind.PARSE,
+                "kuwo detail has no musiclist",
+                null,
+                SourceID.KW,
+            )
         val raw = (0 until ml.length()).mapNotNull { build(ml.optJSONObject(it)) }
         val tracks = fillKuwoCovers(http, raw)
-        val updated = list.copy(
-            name = json.optString("title").ifEmpty { list.name },
-            author = json.optString("uname").ifEmpty { list.author },
-            picURL = json.optString("pic").ifEmpty { null } ?: list.picURL,
-            trackCount = json.optInt("total").takeIf { it > 0 } ?: tracks.size,
+        if (ml.length() > 0 && tracks.isEmpty()) {
+            // Songs were delivered but not one mapped: the field names moved, do not call it empty.
+            throw OnlinePlaylistException(
+                OnlinePlaylistException.Kind.PARSE,
+                "kuwo musiclist did not map to tracks (${ml.length()} entries)",
+                null,
+                SourceID.KW,
+            )
+        }
+        return KuwoPage(
+            tracks = tracks,
+            total = json.optInt("total").takeIf { it > 0 },
+            name = json.optString("title"),
+            author = json.optString("uname"),
+            picURL = json.optString("pic").ifEmpty { null },
         )
-        return SonglistDetail(updated, tracks)
     }
 
     private fun build(d: JSONObject?): Track? {
@@ -162,11 +292,35 @@ private class KuwoSonglist(private val http: CatalogHttp) : SonglistService {
     }
 
     private fun decode(s: String) = s.replace("&nbsp;", " ").replace("&amp;", "&")
+
+    private companion object {
+        /** Songs per `pl.svc` page (`rn`) - the largest the endpoint honours. */
+        const val KUWO_PAGE_SIZE = 300
+
+        /** Hard stop for a runaway paging loop (300 x 100 = 30k songs). */
+        const val KUWO_MAX_PAGES = 100
+    }
+}
+
+/** One `pl.svc` page: the songs plus the metadata Kuwo repeats on every page. */
+private class KuwoPage(
+    val tracks: List<Track>,
+    val total: Int?,
+    val name: String,
+    val author: String,
+    val picURL: String?,
+) {
+    fun info(list: SonglistInfo): SonglistInfo = list.copy(
+        name = name.ifEmpty { list.name },
+        author = author.ifEmpty { list.author },
+        picURL = picURL ?: list.picURL,
+        trackCount = total ?: tracks.size,
+    )
 }
 
 // MARK: - NetEase
 
-private class NetEaseSonglist(private val http: CatalogHttp) : SonglistService {
+internal class NetEaseSonglist(private val http: CatalogHttpLike) : SonglistService {
     override val source = SourceID.WY
     override val orders = listOf(SonglistOrder("hot", "最热"))
 
@@ -228,7 +382,11 @@ private class NetEaseSonglist(private val http: CatalogHttp) : SonglistService {
 
     private suspend fun fetchDetailV6(list: SonglistInfo): SonglistDetail? {
         val pl = runCatching {
-            JSONObject(http.postForm("https://music.163.com/api/v6/playlist/detail", "id=${list.id}&n=100000&s=8", refererHeaders()))
+            parseCatalogJson(
+                http.postForm(NE_V6_DETAIL_URL, "id=${urlEncode(list.id)}&n=100000&s=8", refererHeaders()),
+                SourceID.WY,
+                "playlist detail",
+            )
                 .optJSONObject("playlist")
         }.getOrNull() ?: return null
         val idArr = pl.optJSONArray("trackIds") ?: return null
@@ -247,25 +405,152 @@ private class NetEaseSonglist(private val http: CatalogHttp) : SonglistService {
         return SonglistDetail(updated, tracks)
     }
 
+    /**
+     * All-pages NetEase fetch.
+     *
+     * `v6/playlist/detail` returns the **complete** `trackIds` list even for anonymous callers
+     * (the `tracks` array in the same response is capped at 10, and the old `/api/playlist/detail`
+     * rewrites `trackCount` to 10 as well), so the track objects come from the `/api/song/detail`
+     * batch API instead. Verified against the live API: a 98-track playlist reports `trackIds=98`
+     * and a single 100-id `/api/song/detail` call returns all 98 objects.
+     *
+     * Every *category* of failure stays apart, which is what the old code got wrong: NetEase answers
+     * HTTP 200 with a business code and no `playlist` for anything it refuses - `404 歌单不存在`
+     * (deleted / private / unknown id), `400 请求参数错误` (an id it cannot use, e.g. a link stored by
+     * an older build or an LX Sync record), `-460/-462` (风控). Reporting all of those as "the data
+     * cannot be recognised" is what the user saw.
+     *
+     * A chunk that fails does **not** abort the fetch: the tracks we did get come back with
+     * [SonglistFetchResult.complete] = false so the update path can refuse a destructive mirror.
+     */
+    override suspend fun fetchAll(
+        list: SonglistInfo,
+        onProgress: (fetched: Int, total: Int?) -> Unit,
+    ): SonglistFetchResult {
+        val body = parseCatalogJson(
+            http.postForm(NE_V6_DETAIL_URL, "id=${urlEncode(list.id)}&n=100000&s=8", refererHeaders()),
+            SourceID.WY,
+            "playlist detail",
+        )
+        val code = body.optInt("code", -1)
+        val pl = body.optJSONObject("playlist")
+            ?: throw netEaseDetailMissing(code, body.optString("msg").ifEmpty { body.optString("message") })
+        val idArr = pl.optJSONArray("trackIds")
+            ?: throw OnlinePlaylistException(
+                OnlinePlaylistException.Kind.PARSE,
+                "netease playlist detail has no trackIds (code=$code)",
+                null,
+                SourceID.WY,
+            )
+        val ids = (0 until idArr.length()).mapNotNull { idArr.optJSONObject(it)?.opt("id")?.toString() }
+        // `trackIds` is present but empty: the platform really says the playlist holds nothing.
+        if (ids.isEmpty()) {
+            throw OnlinePlaylistException(
+                OnlinePlaylistException.Kind.EMPTY,
+                "netease playlist has no tracks (trackCount=${pl.optInt("trackCount")})",
+                null,
+                SourceID.WY,
+            )
+        }
+        val declared = pl.optInt("trackCount").takeIf { it > 0 } ?: ids.size
+        val batch = fetchTracksByIdsTracked(ids, onProgress)
+        if (batch.tracks.isEmpty()) {
+            // Report the real reason: every batch request failed (network / content) ... or the
+            // batch response no longer carries `songs`, which is an interface change and must never
+            // be presented as an empty playlist.
+            batch.failure?.let { throw catalogFailure(it, SourceID.WY, "song detail") }
+            throw OnlinePlaylistException(
+                OnlinePlaylistException.Kind.PARSE,
+                "netease song detail mapped no tracks for ${ids.size} ids",
+                null,
+                SourceID.WY,
+            )
+        }
+        if (!batch.complete) {
+            OnlinePlaylistLog.emit(
+                OnlinePlaylistLog.EVENT_FETCH_PAGE_ERROR,
+                OnlinePlaylistLog.ref(SourceID.WY, list.id) + listOf(
+                    "stage" to "song detail",
+                    "fetched" to batch.tracks.size,
+                    "declared" to declared,
+                ),
+            )
+        }
+        val info = list.copy(
+            name = pl.optString("name").ifEmpty { list.name },
+            author = pl.optJSONObject("creator")?.optString("nickname")?.ifEmpty { null } ?: list.author,
+            picURL = pl.optString("coverImgUrl").ifEmpty { null } ?: list.picURL,
+            trackCount = declared,
+        )
+        return SonglistFetchResult(info, batch.tracks, declared, batch.complete)
+    }
+
+    /**
+     * Map NetEase's business code (HTTP 200 + `{"code":n,"msg":"..."}`, no `playlist`) onto a
+     * category. Codes verified against the live API on 2026-10-12: an unknown/deleted id answers
+     * `{"code":404,"msg":"歌单不存在"}`, a non-numeric id (a link) answers
+     * `{"code":400,"msg":"请求参数错误"}`.
+     */
+    private fun netEaseDetailMissing(code: Int, msg: String): OnlinePlaylistException {
+        val kind = when (code) {
+            401, 403 -> OnlinePlaylistException.Kind.AUTH
+            404, -404 -> OnlinePlaylistException.Kind.NOT_FOUND
+            -460, -462, -447, 429, 509 -> OnlinePlaylistException.Kind.RATE_LIMIT
+            400, -400 -> OnlinePlaylistException.Kind.BAD_ID
+            200 -> OnlinePlaylistException.Kind.PARSE
+            else -> OnlinePlaylistException.Kind.CONTENT
+        }
+        return OnlinePlaylistException(
+            kind,
+            "netease playlist detail missing (code=$code ${msg.take(40)})",
+            null,
+            SourceID.WY,
+        )
+    }
+
     /** Batch the old /api/song/detail (old-format fields → buildNetEaseTrack). 100 ids per chunk
-     *  keeps the GET URL ~1.3KB; chunks run in parallel, output re-ordered to match [ids]. */
-    private suspend fun fetchTracksByIds(ids: List<String>): List<Track> {
+     *  keeps the GET URL ~1.3KB; chunks run in parallel, output re-ordered to match [ids].
+     *
+     *  [NetEaseBatch] is what keeps "a chunk failed" apart from "the shape changed": the caller
+     *  needs the first failure to report a real category, and `complete = false` to refuse writing.
+     *  `complete` is false as soon as one chunk failed - and [NetEaseBatch.failure] keeps that
+     *  first failure so the caller can report *why* instead of a fabricated empty list. */
+    private class NetEaseBatch(val tracks: List<Track>, val complete: Boolean, val failure: Throwable?)
+
+    private suspend fun fetchTracksByIdsTracked(
+        ids: List<String>,
+        onProgress: (fetched: Int, total: Int?) -> Unit = { _, _ -> },
+    ): NetEaseBatch {
         val byId = java.util.concurrent.ConcurrentHashMap<String, Track>()
-        coroutineScope {
-            ids.chunked(100).map { chunk ->
+        val done = AtomicInteger(0)
+        val failure = java.util.concurrent.atomic.AtomicReference<Throwable?>()
+        val ok = coroutineScope {
+            ids.chunked(NE_DETAIL_CHUNK).map { chunk ->
                 async {
-                    val url = "https://music.163.com/api/song/detail/?ids=${urlEncode("[${chunk.joinToString(",")}]")}"
-                    val arr = runCatching {
-                        JSONObject(http.getText(url, refererHeaders())).optJSONArray("songs")
-                    }.getOrNull() ?: return@async
-                    for (i in 0 until arr.length()) {
-                        buildNetEaseTrack(arr.optJSONObject(i))?.let { byId[it.songmid] = it }
+                    val url = "$NE_SONG_DETAIL_URL?ids=${urlEncode("[${chunk.joinToString(",")}]")}"
+                    var arr: JSONArray? = null
+                    try {
+                        arr = parseCatalogJson(http.getText(url, refererHeaders()), SourceID.WY, "song detail")
+                            .optJSONArray("songs")
+                    } catch (e: CancellationException) {
+                        throw e
+                    } catch (e: Exception) {
+                        failure.compareAndSet(null, e)
                     }
+                    if (arr != null) {
+                        for (i in 0 until arr.length()) {
+                            buildNetEaseTrack(arr.optJSONObject(i))?.let { byId[it.songmid] = it }
+                        }
+                    }
+                    onProgress(done.addAndGet(chunk.size), ids.size)
+                    arr != null
                 }
             }.awaitAll()
         }
-        return ids.mapNotNull { byId[it] }
+        return NetEaseBatch(ids.mapNotNull { byId[it] }, ok.all { it }, failure.get())
     }
+
+    private suspend fun fetchTracksByIds(ids: List<String>): List<Track> = fetchTracksByIdsTracked(ids).tracks
 
     private fun refererHeaders() = mapOf("Referer" to "https://music.163.com/", "User-Agent" to UA)
 
@@ -278,11 +563,19 @@ private class NetEaseSonglist(private val http: CatalogHttp) : SonglistService {
     )
 
     private fun group(name: String, names: List<String>) = SonglistTagGroup(name, names.map { SonglistTag(it, it) })
+
+    private companion object {
+        const val NE_V6_DETAIL_URL = "https://music.163.com/api/v6/playlist/detail"
+        const val NE_SONG_DETAIL_URL = "https://music.163.com/api/song/detail/"
+
+        /** Ids per `/api/song/detail` request — keeps the GET URL around 1.3KB. */
+        const val NE_DETAIL_CHUNK = 100
+    }
 }
 
 // MARK: - QQ
 
-private class QQSonglist(private val http: CatalogHttp) : SonglistService {
+internal class QQSonglist(private val http: CatalogHttpLike) : SonglistService {
     override val source = SourceID.TX
     override val orders = listOf(SonglistOrder("5", "最热"), SonglistOrder("2", "最新"))
 
@@ -368,9 +661,16 @@ private class QQSonglist(private val http: CatalogHttp) : SonglistService {
         val headers = mapOf("Origin" to "https://y.qq.com", "Referer" to "https://y.qq.com/n/yqq/playsquare/${list.id}.html", "User-Agent" to UA)
         val cd = runCatching {
             JSONObject(http.getText(url, headers)).optJSONArray("cdlist")?.optJSONObject(0)
-        }.getOrNull() ?: return SonglistDetail(list, emptyList())
-        val songlist = cd.optJSONArray("songlist") ?: return SonglistDetail(list, emptyList())
+        }.getOrNull()
+        val songlist = cd?.optJSONArray("songlist")
+        // This endpoint refuses some *public* playlists outright - verified live on 2026-10-12:
+        // disstid 8591179133 answers `subcode:4000 "check privacy error!"` with no `cdlist`, while
+        // `musicu.fcg` serves the same playlist. Fall back to the paging module, which is the same
+        // order LX uses (`getListDetail` -> `getListDetail2`), so browsing a playlist can no longer
+        // come back empty just because this endpoint declined it.
+        if (songlist == null || songlist.length() == 0) return fetchDetailViaPager(list)
         val tracks = (0 until songlist.length()).mapNotNull { buildQqTrack(songlist.optJSONObject(it)) }
+        if (tracks.isEmpty()) return fetchDetailViaPager(list)
         val updated = list.copy(
             name = cd.optString("dissname").ifEmpty { list.name },
             author = cd.optString("nickname").ifEmpty { list.author },
@@ -379,11 +679,336 @@ private class QQSonglist(private val http: CatalogHttp) : SonglistService {
         )
         return SonglistDetail(updated, tracks)
     }
+
+    /**
+     * Browsing fallback: read the list through the paging module when the browse endpoint declines.
+     * Returns an empty detail only when the platform could not be read at all - browsing keeps its
+     * old "no songs" behaviour, while import/update call `fetchAll` directly and report the real
+     * failure category instead of an empty list.
+     */
+    private suspend fun fetchDetailViaPager(list: SonglistInfo): SonglistDetail = try {
+        val all = fetchAll(list)
+        SonglistDetail(all.info, all.tracks)
+    } catch (e: CancellationException) {
+        throw e
+    } catch (e: Exception) {
+        SonglistDetail(list, emptyList())
+    }
+
+    /**
+     * All-pages QQ fetch through `musicu.fcg`, which pages on `song_begin` / `song_num` and reports
+     * the real total in `total_song_num` / `dirinfo.songnum`.
+     *
+     * The `fcg_ucc_getcdinfo_byids_cp` endpoint that the browse path uses is unreliable: re-checked
+     * on 2026-10-12 it refused a public playlist outright (`disstid 8591179133` ->
+     * `subcode:4000 "check privacy error!"`, no `cdlist`) while `musicu` answered the same playlist
+     * with `code: 0`, and it cannot page at all. A list it refused used to read as "empty".
+     *
+     * Field notes verified against the live API on 2026-10-12 (playlist 9744256455, 1269 songs):
+     * the response envelope is `{"code":0,"req_1":{"code":0,"data":{...}}}`, the songs are in
+     * `data.songlist` in the same shape [buildQqTrack] reads, `data.total_song_num` and
+     * `data.dirinfo.songnum` both report 1269, `data.hasmore` flips 1 → 0 on the last page, and
+     * `song_begin=1200&song_num=300` returns the final 69 songs.
+     *
+     * Sent as a POSTed JSON body - the transport LX uses for this call (`tx/songList.js`:
+     * `httpFetch(..., { method: 'post' })`) and the one this project pins with a regression test.
+     * (Re-checked on 2026-10-12 a GET `?data=` with the same params was answered with `code: 0` too,
+     * so the verb is a consistency choice rather than a workaround for a rejected request.)
+     *
+     * **A short page is not the end of the list.** The platform silently drops songs it cannot
+     * serve (无版权 / 下架) and `total_song_num` drifts down as it does: live-checked on 2026-10-12,
+     * the 1967-song 「我喜欢」 playlist (disstid 1113832590) answers 300/300/300/299/299/294/166 with
+     * `song_num=300` - 1958 distinct songs, no duplicates, no gaps - while `song_num=1000` answers
+     * 1000 then 958, and the last page reports the true reachable total (1958) with `hasmore=0`.
+     * `hasmore` is therefore the end-of-list signal, *not* the page length. Stopping at the first
+     * short page read 1199 of those 1958 songs, so the follow-up `tracks.size < declared` check
+     * reported `complete=false` and the update was refused with `INCOMPLETE` - the failure in the
+     * 2026-10-12 TV log.
+     */
+    override suspend fun fetchAll(
+        list: SonglistInfo,
+        onProgress: (fetched: Int, total: Int?) -> Unit,
+    ): SonglistFetchResult {
+        val tracks = ArrayList<Track>()
+        var info: SonglistInfo? = null
+        var declared: Int? = null
+        var firstPageSongs = 0
+        var complete = true
+        // Set once the platform demonstrably served the *whole* list: an empty page, a reported
+        // `hasmore=0`, or a page that reached the total it declared. A short page is deliberately
+        // not one of those - see the doc above.
+        var ended = false
+        var begin = 0
+        var failure: Throwable? = null
+        while (true) {
+            val page = try {
+                fetchDissPage(list.id, begin, QQ_PAGE_SIZE)
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                // The list itself is unreadable: report the real category. A *later* page failing is
+                // a partial read instead - never thrown away, and never written over the local copy.
+                if (begin == 0) throw e
+                failure = e
+                complete = false
+                break
+            }
+            if (page == null) {
+                if (begin == 0) {
+                    throw OnlinePlaylistException(
+                        OnlinePlaylistException.Kind.CONTENT,
+                        "qq playlist page 0 returned nothing usable",
+                        null,
+                        SourceID.TX,
+                    )
+                }
+                complete = false
+                break
+            }
+            if (info == null) {
+                declared = page.total
+                info = list.copy(
+                    name = page.dirinfo.optString("title").ifEmpty { list.name }.decodeHtmlEntities(),
+                    author = page.dirinfo.optString("host_nick").ifEmpty { list.author }.decodeHtmlEntities(),
+                    picURL = page.dirinfo.optString("picurl").ifEmpty { null } ?: list.picURL,
+                    trackCount = declared,
+                )
+            }
+            // An empty page means "nothing at this offset": there is nothing left to read. Its own
+            // `total_song_num` is the stale pre-filter count, so `declared` is only ever refreshed
+            // from non-empty pages (below) - otherwise the last, empty page would drag the total
+            // back up and the completeness check would fail again.
+            if (page.songs.isEmpty()) {
+                ended = true
+                break
+            }
+            // Deeper pages report the reachable total more accurately (the platform keeps dropping
+            // songs as it pages), so the latest non-empty page wins.
+            if (begin != 0) page.total?.let { declared = it }
+            if (begin == 0) firstPageSongs = page.songs.size
+            tracks += page.songs
+            onProgress(tracks.size, declared)
+            val target = declared
+            if (target != null && tracks.size >= target) {
+                ended = true
+                break
+            }
+            if (!page.hasMore) {
+                // A *reported* hasmore=0 is the platform saying "that was the last page". With the
+                // field absent the old "the page came back short" guess is all we have: keep
+                // paging-or-stopping on it, but never call the result complete on a guess.
+                ended = page.hasMoreReported
+                break
+            }
+            begin += QQ_PAGE_SIZE
+            if (begin > QQ_MAX_TRACKS) {
+                complete = false
+                break
+            }
+        }
+        if (tracks.isEmpty()) {
+            failure?.let { throw catalogFailure(it, SourceID.TX, "playlist page") }
+            // The page parsed and declared songs, yet nothing mapped: `songlist` moved, so this is
+            // an interface change rather than an empty playlist.
+            if ((declared ?: 0) > 0) {
+                throw OnlinePlaylistException(
+                    OnlinePlaylistException.Kind.PARSE,
+                    "qq playlist declares $declared songs but the song list is empty",
+                    null,
+                    SourceID.TX,
+                )
+            }
+            throw OnlinePlaylistException(
+                OnlinePlaylistException.Kind.EMPTY,
+                "qq playlist has no songs",
+                null,
+                SourceID.TX,
+            )
+        }
+        // A platform that under-delivers against its own total is a partial read, not a mirror
+        // instruction: the update path must refuse instead of deleting the songs it did not see.
+        // `ended` guards the other direction - whatever stopped the loop above has to be a real
+        // end-of-list marker, or everything after that point was never seen.
+        if (!ended) complete = false
+        val expected = declared
+        if (expected != null && tracks.size < expected) complete = false
+        if (!complete) {
+            OnlinePlaylistLog.emit(
+                OnlinePlaylistLog.EVENT_FETCH_PAGE_ERROR,
+                OnlinePlaylistLog.ref(SourceID.TX, list.id) + listOf(
+                    "stage" to "playlist page",
+                    "begin" to begin,
+                    "fetched" to tracks.size,
+                    "declared" to declared,
+                    "firstPage" to firstPageSongs,
+                    "reason" to (
+                        failure?.let { "request" }
+                            ?: if (ended) "under-declared" else "no-end-marker"
+                        ),
+                ),
+            )
+        }
+        val resolved = (info ?: list).copy(trackCount = declared ?: tracks.size)
+        return SonglistFetchResult(resolved, tracks, declared, complete)
+    }
+
+    /** One diss page: the songs plus what the platform says about the list. */
+    private class QqDissPage(
+        val dirinfo: JSONObject,
+        val songs: List<Track>,
+        val total: Int?,
+        val hasMore: Boolean,
+        /** True when the payload carried a `hasmore` field, i.e. [hasMore] is not a guess. */
+        val hasMoreReported: Boolean,
+    )
+
+    /**
+     * One `musicu` page, POSTed as a JSON body.
+     *
+     * `music.srfDissInfo.aiDissInfo / uniform_get_Dissinfo` is today's module (LX uses it after the
+     * `fcg_ucc_getcdinfo_byids_cp` call comes back without a `cdlist`); `music.srfDissInfo.DissInfo /
+     * CgiGetDiss` still answers the same shape, so it is the fallback when the newer module refuses
+     * on the first page. Business codes are mapped, never collapsed - `-100006` means the playlist
+     * is gone (verified live: an unknown disstid answers `data.code=-100006 "get diss info from tmem
+     * error"`), while `-100008` / `10004` stay apart from NOT_FOUND because they mean the *request*
+     * was refused rather than the playlist being missing. An unrecognised code is not read as a
+     * deletion either - we cannot see one, so it is reported as unusable content and retried later.
+     */
+    private suspend fun fetchDissPage(disstid: String, begin: Int, num: Int): QqDissPage? {
+        val page = try {
+            requestDiss(QQ_DISS_MODULE, QQ_DISS_METHOD, disstid, begin, num)
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: OnlinePlaylistException) {
+            // Only a shape problem falls through to the older module, and only for the first page:
+            // retrying a limit/auth failure would make throttling worse.
+            if (begin != 0 || e.kind != OnlinePlaylistException.Kind.PARSE) throw e
+            requestDiss(QQ_LEGACY_DISS_MODULE, QQ_LEGACY_DISS_METHOD, disstid, begin, num)
+        }
+        return page
+    }
+
+    private suspend fun requestDiss(
+        module: String,
+        method: String,
+        disstid: String,
+        begin: Int,
+        num: Int,
+    ): QqDissPage {
+        val body = JSONObject()
+            .put(
+                "comm",
+                JSONObject()
+                    .put("cv", 1602).put("ct", 20).put("format", "json")
+                    .put("inCharset", "utf-8").put("outCharset", "utf-8")
+                    .put("platform", "wk_v15.json").put("needNewCode", 0).put("uin", 0),
+            )
+            .put(
+                "req_1",
+                JSONObject()
+                    .put("module", module)
+                    .put("method", method)
+                    .put(
+                        "param",
+                        JSONObject()
+                            .put("disstid", disstid.toLongOrNull() ?: disstid)
+                            .put("dirid", 0)
+                            .put("tag", 1)
+                            .put("song_begin", begin)
+                            .put("song_num", num)
+                            .put("userinfo", 1),
+                    ),
+            )
+        val headers = mapOf(
+            "Referer" to "https://y.qq.com/",
+            "Origin" to "https://y.qq.com",
+            "User-Agent" to UA,
+        )
+        val outer = parseCatalogJson(
+            http.postJson(QQ_FCG_URL, body.toString(), headers),
+            SourceID.TX,
+            "playlist page ${begin / num}",
+        )
+        val req = outer.optJSONObject("req_1")
+            ?: throw OnlinePlaylistException(
+                OnlinePlaylistException.Kind.PARSE,
+                "qq response has no req_1",
+                null,
+                SourceID.TX,
+            )
+        val code = req.optInt("code", -1)
+        if (code != 0) throw qqBusiness(code, req)
+        val data = req.optJSONObject("data")
+            ?: throw OnlinePlaylistException(
+                OnlinePlaylistException.Kind.PARSE,
+                "qq response has no data",
+                null,
+                SourceID.TX,
+            )
+        val innerCode = data.optInt("code", 0)
+        if (innerCode != 0) throw qqBusiness(innerCode, data)
+        val dirinfo = data.optJSONObject("dirinfo") ?: JSONObject()
+        val arr = data.optJSONArray("songlist")
+            ?: throw OnlinePlaylistException(
+                OnlinePlaylistException.Kind.PARSE,
+                "qq page has no songlist array",
+                null,
+                SourceID.TX,
+            )
+        val songs = (0 until arr.length()).mapNotNull { buildQqTrack(arr.optJSONObject(it)) }
+        val total = data.optInt("total_song_num", 0).takeIf { it > 0 }
+            ?: dirinfo.optInt("songnum").takeIf { it > 0 }
+        val hasMoreReported = data.has("hasmore")
+        val hasMore = if (hasMoreReported) data.optInt("hasmore") != 0 else songs.size >= num
+        return QqDissPage(dirinfo, songs, total, hasMore, hasMoreReported)
+    }
+
+    /** Business codes verified against the live API on 2026-10-12 (see [requestDiss]). */
+    private fun qqBusiness(code: Int, obj: JSONObject): OnlinePlaylistException {
+        val msg = obj.optString("msg").ifEmpty { obj.optString("errmsg") }
+        val kind = when (code) {
+            1000, 1001, -1000 -> OnlinePlaylistException.Kind.AUTH
+            1041, 1042, -1041, -1042 -> OnlinePlaylistException.Kind.RATE_LIMIT
+            -100006 -> OnlinePlaylistException.Kind.NOT_FOUND
+            -100008, 10004 -> OnlinePlaylistException.Kind.PARSE
+            // Not evidence the playlist is gone: report "nothing usable came back" (retryable)
+            // instead of claiming a deletion we cannot see.
+            else -> OnlinePlaylistException.Kind.CONTENT
+        }
+        return OnlinePlaylistException(
+            kind,
+            "qq diss code=$code ${msg.take(40)}",
+            null,
+            SourceID.TX,
+        )
+    }
+
+    private companion object {
+        /**
+         * Songs per diss page (`song_num`). The endpoint honours 1000 (verified live on
+         * 2026-10-12), so a 2000-song list costs two round trips instead of seven while a single
+         * response stays around a megabyte - asking for the whole list at once (LX's
+         * `limit_song = 100000`) would pull a 20k-song playlist's JSON into a TV box's memory.
+         */
+        const val QQ_PAGE_SIZE = 1000
+
+        /** Hard stop for a runaway paging loop. */
+        const val QQ_MAX_TRACKS = 50_000
+
+        /** `musicu.fcg`, POSTed with a JSON body (see [fetchAll]). */
+        const val QQ_FCG_URL = "https://u.y.qq.com/cgi-bin/musicu.fcg"
+
+        /** Today's diss module (LX falls back to this one), or the older one when it refuses. */
+        const val QQ_DISS_MODULE = "music.srfDissInfo.aiDissInfo"
+        const val QQ_DISS_METHOD = "uniform_get_Dissinfo"
+        const val QQ_LEGACY_DISS_MODULE = "music.srfDissInfo.DissInfo"
+        const val QQ_LEGACY_DISS_METHOD = "CgiGetDiss"
+    }
 }
 
 // MARK: - Kugou
 
-private class KugouSonglist(private val http: CatalogHttp) : SonglistService {
+internal class KugouSonglist(private val http: CatalogHttpLike) : SonglistService {
     override val source = SourceID.KG
     override val orders = listOf(
         SonglistOrder("5", "推荐"), SonglistOrder("6", "最热"), SonglistOrder("7", "最新"),
@@ -447,27 +1072,100 @@ private class KugouSonglist(private val http: CatalogHttp) : SonglistService {
     }
 
     override suspend fun fetchDetail(list: SonglistInfo): SonglistDetail {
-        // 概念版短链（t1.kugou.com/xxx）：先联网跟随跳转，从最终 URL 抽出 collection_ id。
+        val hashes = readHashes(list)
+        if (hashes.isEmpty()) return SonglistDetail(list, emptyList())
+        val tracks = resolveHashesTracked(hashes).tracks
+        return SonglistDetail(list.copy(trackCount = tracks.size), tracks)
+    }
+
+    /**
+     * All-songs 酷狗 fetch.
+     *
+     * The `single/<id>-5-9999.html` page embeds the whole list in `global.data = [...]` - verified
+     * live on 2026-10-12: a 300-song playlist ships all 300 objects and a 933-song one ships 853
+     * (酷狗 itself omits songs it can no longer serve, which is why LX reports `total =
+     * list.length` rather than the declared count). Track details then come from the batched
+     * `album_audio` call.
+     *
+     * A chunk that fails now makes the result **incomplete**. The old code swallowed chunk failures
+     * (`runCatching { resolveChunk(chunk) }.getOrDefault(emptyList())`) and still reported
+     * `complete = true`, so a mirror update would delete every song the failed chunk carried.
+     */
+    override suspend fun fetchAll(
+        list: SonglistInfo,
+        onProgress: (fetched: Int, total: Int?) -> Unit,
+    ): SonglistFetchResult {
+        val hashes = readHashes(list)
+        if (hashes.isEmpty()) {
+            throw OnlinePlaylistException(
+                OnlinePlaylistException.Kind.EMPTY,
+                "kugou playlist has no songs",
+                null,
+                SourceID.KG,
+            )
+        }
+        val batch = resolveHashesTracked(hashes, onProgress)
+        if (batch.tracks.isEmpty()) {
+            batch.failure?.let { throw catalogFailure(it, SourceID.KG, "audio detail") }
+            throw OnlinePlaylistException(
+                OnlinePlaylistException.Kind.PARSE,
+                "kugou audio detail mapped no tracks for ${hashes.size} hashes",
+                null,
+                SourceID.KG,
+            )
+        }
+        if (!batch.complete) {
+            OnlinePlaylistLog.emit(
+                OnlinePlaylistLog.EVENT_FETCH_PAGE_ERROR,
+                OnlinePlaylistLog.ref(SourceID.KG, list.id) + listOf(
+                    "stage" to "audio detail",
+                    "fetched" to batch.tracks.size,
+                    "declared" to hashes.size,
+                ),
+            )
+        }
+        // 酷狗 reports no trustworthy total, so "how many we could read" is the only number there is.
+        return SonglistFetchResult(
+            list.copy(trackCount = batch.tracks.size),
+            batch.tracks,
+            null,
+            batch.complete,
+        )
+    }
+
+    /**
+     * Read the playlist's song hashes.
+     *
+     * 概念版短链（t1.kugou.com/xxx）先联网跟随跳转抽出 collection_ id；概念版歌单
+     * （collection_3_...）走独立的签名分页接口；普通歌单走老的 single html 抓 hash。
+     * A bogus/deleted id answers with 酷狗's generic HTML page instead of the song data (verified
+     * live: a 3.5 KB document for specialid=1/999999999), which is a *not found*, not an empty
+     * playlist.
+     */
+    private suspend fun readHashes(list: SonglistInfo): List<String> {
         val effectiveId = if (list.id.startsWith("http", ignoreCase = true)) {
-            resolveConceptShortLink(list.id) ?: return SonglistDetail(list, emptyList())
+            resolveConceptShortLink(list.id) ?: throw OnlinePlaylistException(
+                OnlinePlaylistException.Kind.BAD_ID,
+                "kugou share link carried no collection id",
+                null,
+                SourceID.KG,
+            )
         } else {
             list.id
         }
-        // 概念版歌单（酷狗概念版 App 分享）的 id 形如 collection_3_2122406585_2_0，走独立的
-        // 签名分页接口；普通歌单仍走老的 single html 抓 hash。
-        if (effectiveId.startsWith("collection_")) {
-            val hashes = fetchConceptHashes(effectiveId)
-            if (hashes.isEmpty()) return SonglistDetail(list, emptyList())
-            val tracks = resolveHashes(hashes)
-            return SonglistDetail(list.copy(trackCount = tracks.size), tracks)
+        if (effectiveId.startsWith("collection_")) return fetchConceptHashes(effectiveId)
+        val htmlUrl = "http://www2.kugou.kugou.com/yueku/v9/special/single/${effectiveId}-5-9999.html"
+        val html = http.getText(htmlUrl, mapOf("User-Agent" to kgUA))
+        if (!html.contains(KG_LIST_MARKER)) {
+            throw OnlinePlaylistException(
+                if (html.trimStart().startsWith("<")) OnlinePlaylistException.Kind.NOT_FOUND
+                else OnlinePlaylistException.Kind.CONTENT,
+                "kugou playlist page has no song data (${describeBody(html)})",
+                null,
+                SourceID.KG,
+            )
         }
-        val htmlUrl = "http://www2.kugou.kugou.com/yueku/v9/special/single/${list.id}-5-9999.html"
-        val html = runCatching { http.getText(htmlUrl, mapOf("User-Agent" to kgUA)) }.getOrNull()
-            ?: return SonglistDetail(list, emptyList())
-        val hashes = extractHashes(html)
-        if (hashes.isEmpty()) return SonglistDetail(list, emptyList())
-        val tracks = resolveHashes(hashes)
-        return SonglistDetail(list.copy(trackCount = tracks.size), tracks)
+        return extractHashes(html)
     }
 
     /**
@@ -516,10 +1214,9 @@ private class KugouSonglist(private val http: CatalogHttp) : SonglistService {
     }
 
     private fun extractHashes(html: String): List<String> {
-        val marker = "global.data = "
-        val start = html.indexOf(marker)
+        val start = html.indexOf(KG_LIST_MARKER)
         if (start < 0) return emptyList()
-        val after = html.substring(start + marker.length)
+        val after = html.substring(start + KG_LIST_MARKER.length)
         val end = after.indexOf("];")
         if (end < 0) return emptyList()
         val arrLiteral = after.substring(0, end + 1)
@@ -527,12 +1224,39 @@ private class KugouSonglist(private val http: CatalogHttp) : SonglistService {
         return (0 until arr.length()).mapNotNull { arr.optJSONObject(it)?.optString("hash")?.ifEmpty { null }?.uppercase() }
     }
 
-    private suspend fun resolveHashes(hashes: List<String>): List<Track> {
-        val chunks = hashes.chunked(100)
+    /**
+     * Resolve hashes to tracks in hundred-hash batches, **tracking failures**.
+     *
+     * Batches run in parallel and keep their position, so a half-readable playlist still comes back
+     * in order - but [KugouBatch.complete] goes false. The old code swallowed the failure
+     * (`runCatching { resolveChunk(chunk) }.getOrDefault(emptyList())`) and still reported the fetch
+     * as complete, so a mirror update would have deleted every song a failed batch carried.
+     */
+    private suspend fun resolveHashesTracked(
+        hashes: List<String>,
+        onProgress: (fetched: Int, total: Int?) -> Unit = { _, _ -> },
+    ): KugouBatch {
+        if (hashes.isEmpty()) return KugouBatch(emptyList(), complete = true, failure = null)
+        val chunks = hashes.chunked(KG_DETAIL_CHUNK)
+        val done = AtomicInteger(0)
         val indexed = coroutineScope {
-            chunks.mapIndexed { i, chunk -> async { i to runCatching { resolveChunk(chunk) }.getOrDefault(emptyList()) } }.awaitAll()
+            chunks.mapIndexed { index, chunk ->
+                async {
+                    try {
+                        val tracks = resolveChunk(chunk)
+                        onProgress(done.addAndGet(chunk.size), hashes.size)
+                        KugouChunk(index, tracks, null)
+                    } catch (e: CancellationException) {
+                        throw e
+                    } catch (e: Throwable) {
+                        KugouChunk(index, null, e)
+                    }
+                }
+            }.awaitAll()
         }
-        return indexed.sortedBy { it.first }.flatMap { it.second }
+        val failure = indexed.firstOrNull { it.failure != null }?.failure
+        val tracks = indexed.sortedBy { it.index }.flatMap { it.tracks ?: emptyList() }
+        return KugouBatch(tracks, complete = failure == null, failure = failure)
     }
 
     private suspend fun resolveChunk(hashes: List<String>): List<Track> {
@@ -547,9 +1271,16 @@ private class KugouSonglist(private val http: CatalogHttp) : SonglistService {
             "KG-THash" to "13a3164", "KG-RC" to "1", "KG-Fake" to "0", "KG-RF" to "00869891",
             "User-Agent" to "Android712-AndroidPhone-11451-376-0-FeeCacheUpdate-wifi", "x-router" to "kmr.service.kugou.com",
         )
-        val outer = runCatching {
-            JSONObject(http.postJson("http://gateway.kugou.com/v2/album_audio/audio", body.toString(), headers)).optJSONArray("data")
-        }.getOrNull() ?: return emptyList()
+        val outer = parseCatalogJson(
+            http.postJson(KG_AUDIO_URL, body.toString(), headers),
+            SourceID.KG,
+            "audio detail",
+        ).optJSONArray("data") ?: throw OnlinePlaylistException(
+            OnlinePlaylistException.Kind.PARSE,
+            "audio detail: response has no data array",
+            null,
+            SourceID.KG,
+        )
         val out = mutableListOf<Track>()
         for (i in 0 until outer.length()) {
             val row = outer.opt(i)
@@ -604,4 +1335,20 @@ private class KugouSonglist(private val http: CatalogHttp) : SonglistService {
     }
 
     private fun decode(s: String) = s.replace("&nbsp;", " ").replace("&amp;", "&")
+
+    private companion object {
+        /** The song array on `single/<id>-5-9999.html`; absent means the page is not a playlist. */
+        const val KG_LIST_MARKER = "global.data = "
+
+        /** album_audio takes at most 100 hashes per request. */
+        const val KG_DETAIL_CHUNK = 100
+
+        const val KG_AUDIO_URL = "http://gateway.kugou.com/v2/album_audio/audio"
+    }
 }
+
+/** One batch of the 酷狗 hash->track resolution, carrying whether it succeeded. */
+private class KugouChunk(val index: Int, val tracks: List<Track>?, val failure: Throwable?)
+
+/** Outcome of resolving a whole 酷狗 hash list: [complete] is false when any batch failed. */
+private class KugouBatch(val tracks: List<Track>, val complete: Boolean, val failure: Throwable?)
