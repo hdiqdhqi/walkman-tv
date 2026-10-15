@@ -516,7 +516,7 @@ private fun VinylDisc(
             colors = listOf(
               palette.glow.copy(alpha = 0.55f * palette.glowStrength),
               palette.glow.copy(alpha = 0.20f * palette.glowStrength),
-              Color.Transparent,
+              palette.glow.copy(alpha = 0.00f),
             ),
           ),
         ),
