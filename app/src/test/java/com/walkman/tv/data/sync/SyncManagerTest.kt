@@ -531,6 +531,30 @@ class SyncManagerTest {
         assertTrue(client.pushedActions.isEmpty())
         assertEquals(listOf("kw_new"), libraryStore.syncLists().love.map { it.id })
     }
+
+    @Test(timeout = 60_000)
+    fun `an edit is uploaded even though auto sync is off (the TV default)`() {
+        // The reported setup: sync configured, 合并 chosen, 自动同步 off - i.e. the TV never has a
+        // live session, so nothing can be pushed incrementally. The edit still has to leave the
+        // device: otherwise the server never hears about it and no other device can ever pick it up,
+        // which is exactly "电视端修改无法同步到电脑或手机". 自动同步 governs *unattended* syncing
+        // (start-up, background platform refreshes), never whether the user's own edit is uploaded.
+        enableSync(autoSync = false)
+        rememberMode(LxSyncProtocol.SYNC_MODE_MERGE_LOCAL_REMOTE)
+        manager.start()
+        assertEquals("nothing to sync yet, so no session", 0, client.sessions.get())
+
+        runBlocking { libraryStore.toggleFavorite(track(songmid = "new")) }
+
+        runBlocking {
+            val deadline = System.currentTimeMillis() + 40_000
+            while (manager.state.value != SyncState.Success && System.currentTimeMillis() < deadline) delay(50)
+        }
+        assertEquals("the edit must open a session and reach the server", 1, client.sessions.get())
+        assertEquals(SyncState.Success, manager.state.value)
+        assertTrue("the upload must carry the edit", client.lastUpload!!.contains("kw_new"))
+        assertEquals(listOf("kw_new"), libraryStore.syncLists().love.map { it.id })
+    }
 }
 
 /**

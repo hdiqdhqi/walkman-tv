@@ -5,6 +5,7 @@ import com.walkman.tv.data.store.LibraryStore
 import com.walkman.tv.data.store.Settings
 import com.walkman.tv.data.store.SettingsStore
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
@@ -18,6 +19,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withTimeoutOrNull
+import java.util.concurrent.atomic.AtomicBoolean
 
 /**
  * Owns the sync lifecycle: when to connect, what the user-visible state is, and making sure only
@@ -352,47 +354,98 @@ class SyncManager(
 
     /**
      * Watches the local lists: a user edit *and* a real online-songlist refresh are this device's
-     * own change, so both are delivered as an incremental `onListSyncAction` while a session is up.
-     * A change that cannot be pushed (no live session, nothing agreed with this server yet) falls
-     * back to a whole session, which the 自动同步 setting governs. The applier never emits
-     * [LibraryStore.changes], so applying a server action cannot re-trigger a sync here - this
-     * module's equivalent of the official `isApplyingRemoteSync` recursion guard.
+     * own change, so both are delivered as an incremental `onListSyncAction` while a session is up,
+     * and by a whole session when they cannot be pushed - see [deliverEdit]. The applier never
+     * emits [LibraryStore.changes], so applying a server action cannot re-trigger a sync here -
+     * this module's equivalent of the official `isApplyingRemoteSync` recursion guard.
+     *
+     * Edits are consumed one at a time from a conflated channel instead of "cancel the previous
+     * job": a burst (a batch import) still collapses into a single delivery, but a delivery that is
+     * already talking to the server is never cancelled half-way - a session killed mid-flight left
+     * the edit neither on the server nor on its way (the old `pending?.cancel()` could abort a
+     * whole session that way).
      */
     private fun observeLocalChanges() {
         if (autoSyncJob != null) return
         autoSyncJob = scope.launch {
-            var pending: Job? = null
-            libraryStore.changes.collect { source ->
-                // Coalesce a burst of edits (e.g. a batch import) into one sync; no polling.
-                pending?.cancel()
-                pending = scope.launch {
-                    val userEdit = source == LibraryStore.ListChangeSource.USER
-                    SyncLog.newChain()
-                    SyncLog.emit(
-                        SyncLog.EVENT_CHANGE_DETECTED,
-                        listOf("source" to if (userEdit) "user" else "online_refresh") +
-                            SyncLog.sizes(libraryStore.syncLists()),
-                    )
-                    // A user edit *and* a real online-songlist refresh are both this device's own
-                    // change, so both are delivered as an incremental official action as soon as a
-                    // session is up - that is the official behaviour and it is the uplink that was
-                    // missing (the refresh used to be swallowed entirely, which is why "我喜欢"
-                    // gained a song on the TV and the server never heard about it, spec §4.1/§4.3).
-                    delay(PUSH_DEBOUNCE_MS)
-                    val delivered = pushLocalEdits(
-                        if (userEdit) TRIGGER_LOCAL_EDIT else TRIGGER_ONLINE_REFRESH,
-                    )
-                    if (!delivered) {
-                        // No live session, or nothing agreed with this server yet: a whole session
-                        // carries the change instead, governed by the 自动同步 setting. An online
-                        // refresh first waits out the settle window it always used, so a burst of
-                        // platform checks cannot start a session each; a user edit stays as immediate
-                        // as the incremental push was. A refresh that only reordered the same songs
-                        // built no action at all, so it neither pushes nor starts a sync (spec §4.3).
-                        if (!userEdit) delay(AUTO_SYNC_DEBOUNCE_MS)
-                        maybeAutoSync()
-                    }
+            val pending = Channel<Unit>(Channel.CONFLATED)
+            val userEditPending = AtomicBoolean(false)
+            launch {
+                libraryStore.changes.collect { source ->
+                    if (source == LibraryStore.ListChangeSource.USER) userEditPending.set(true)
+                    pending.trySend(Unit)
                 }
+            }
+            for (ignored in pending) {
+                val userEdit = userEditPending.getAndSet(false)
+                SyncLog.newChain()
+                SyncLog.emit(
+                    SyncLog.EVENT_CHANGE_DETECTED,
+                    listOf("source" to if (userEdit) "user" else "online_refresh") +
+                        SyncLog.sizes(libraryStore.syncLists()),
+                )
+                // A user edit *and* a real online-songlist refresh are both this device's own
+                // change, so both are delivered as an incremental official action as soon as a
+                // session is up - that is the official behaviour and it is the uplink that was
+                // missing (the refresh used to be swallowed entirely, which is why "我喜欢"
+                // gained a song on the TV and the server never heard about it, spec §4.1/§4.3).
+                delay(PUSH_DEBOUNCE_MS)
+                deliverEdit(
+                    userEdit = userEdit,
+                    reason = if (userEdit) TRIGGER_LOCAL_EDIT else TRIGGER_ONLINE_REFRESH,
+                )
+            }
+        }
+    }
+
+    /**
+     * Gets one local change to the server. Step 1 is the official incremental push, which needs a
+     * live session *and* something already agreed with this server; step 2 is the whole-session
+     * fallback for whatever step 1 could not deliver. There is no third step - a change that reaches
+     * neither is still in the library and travels with the next sync.
+     *
+     * Two rules keep a change from being lost silently, which is exactly how "the TV has the song,
+     * the server does not" happened:
+     *
+     *  - **The gate is waited for, never skipped.** [gate] is shared with whole sessions and can be
+     *    held for minutes, so the old `tryLock` used to drop this delivery with no retry - the change
+     *    the user had just made stayed on the TV until some unrelated edit came along.
+     *  - **An edit the user made is always uploaded while sync is on.** 自动同步 governs *unattended*
+     *    syncing - the sync on start-up and the fallback of a platform refresh - never whether the
+     *    thing the user just did leaves the device. Gating the fallback on it turned the default
+     *    configuration (自动同步 off) into a read-only client: every edit sat in `library.json` and
+     *    no other device ever heard about it.
+     */
+    private suspend fun deliverEdit(userEdit: Boolean, reason: String) {
+        if (pushLocalEdits(reason)) return
+        if (!userEdit) {
+            // A platform check runs every few minutes and can fire repeatedly; wait out the settle
+            // window so a burst cannot start a session each, and leave a background refresh under
+            // the 自动同步 setting. An order-only re-read built no action at all, so it neither
+            // pushes nor starts a sync (spec §4.3).
+            delay(AUTO_SYNC_DEBOUNCE_MS)
+            if (!settingsStore.settings.value.syncAutoSync) return
+        }
+        openSessionForEdit(reason)
+    }
+
+    /**
+     * The whole-session fallback: opens a session so an edit the incremental push could not deliver
+     * still reaches the server. Runs under the gate and *waits* for it - the edit matters, not saving
+     * a session.
+     */
+    private suspend fun openSessionForEdit(reason: String) {
+        val settings = settingsStore.settings.value
+        if (!settings.syncEnabled || currentConfig() == null) return
+        gate.withLock {
+            // While this waited for the gate a session may have come up, or the post-session flush
+            // may have carried the change: retry the (cheap) push once under the lock before spending
+            // a whole session on it.
+            when (pusher.pushPending(reason)) {
+                is LxListPusher.Outcome.Pushed, LxListPusher.Outcome.NoChange -> return
+                // Still nothing to push over, or the server refused an action: a full session
+                // re-merges everything and reports the real outcome (spec §6.7).
+                else -> runSyncGuarded()
             }
         }
     }
@@ -426,24 +479,6 @@ class SyncManager(
         scope.launch {
             delay(PUSH_DEBOUNCE_MS)
             pushLocalEdits(TRIGGER_AFTER_SYNC)
-        }
-    }
-
-    /**
-     * Auto-sync for a *user* edit. The applier never emits [LibraryStore.changes], so applying a
-     * server action cannot re-trigger a sync here - this module's equivalent of the official
-     * `isApplyingRemoteSync` recursion guard. A sync already in flight is skipped: it reads the
-     * current library anyway.
-     */
-    private suspend fun maybeAutoSync() {
-        val settings = settingsStore.settings.value
-        if (!settings.syncEnabled || !settings.syncAutoSync) return
-        if (currentConfig() == null) return
-        if (!gate.tryLock()) return
-        try {
-            runSyncGuarded()
-        } finally {
-            gate.unlock()
         }
     }
 

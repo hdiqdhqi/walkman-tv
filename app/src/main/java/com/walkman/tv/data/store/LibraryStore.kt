@@ -146,6 +146,21 @@ class LibraryStore(filesDir: File) {
         notifyChanged()
     }
 
+    /**
+     * Renames a user list. The LX protocol carries the name as list metadata (`list_update`), so a
+     * rename on the TV reaches every other device; without this mutator the TV had no way to make
+     * that change at all. Blank names are ignored (a list without a name is not a rename).
+     */
+    suspend fun renameList(id: String, name: String) = writeLock.withLock {
+        val trimmed = name.trim()
+        if (trimmed.isEmpty()) return@withLock
+        _userLists.value = _userLists.value.map {
+            if (it.id == id) it.copy(name = trimmed, updatedAt = System.currentTimeMillis()) else it
+        }
+        persist()
+        notifyChanged()
+    }
+
     suspend fun addToList(listId: String, track: Track) = writeLock.withLock {
         _userLists.value = _userLists.value.map {
             if (it.id == listId && it.tracks.none { t -> t.id == track.id }) {
